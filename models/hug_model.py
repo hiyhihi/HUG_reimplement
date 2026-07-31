@@ -46,12 +46,16 @@ class HUGModel(nn.Module):
         blip_model_name: str = "pretrain",  # LAVIS model type (pretrain, pretrain_vitL, coco)
         freeze_vision_encoder: bool = True,
         uncertainty_num_heads: int = 4,
-        uncertainty_dropout: float = 0.1
+        uncertainty_dropout: float = 0.1,
+        text_feature_mode: str = "query_tokens",
+        uncertainty_is_variance: bool = True
     ):
         super().__init__()
 
         self.num_queries = num_queries
         self.hidden_dim = hidden_dim
+        self.text_feature_mode = text_feature_mode
+        self.uncertainty_is_variance = uncertainty_is_variance
 
         # BLIP-2 Q-Former backbone
         self.blip_backbone = BLIPBackbone(
@@ -91,7 +95,7 @@ class HUGModel(nn.Module):
         )
 
         # Dynamic weighting module
-        self.dynamic_weighting = DynamicWeighting()
+        self.dynamic_weighting = DynamicWeighting(input_is_variance=uncertainty_is_variance)
 
     def extract_target_features(
         self,
@@ -117,8 +121,6 @@ class HUGModel(nn.Module):
             pixel_values=target_pixel_values,
             query_embeds=query_embeds
         )
-        # mu_c = F.normalize(mu_c, dim=-1)
-        print("mu_c grad:", mu_c.requires_grad)    
         # Estimate uncertainty using visual uncertainty estimator
         sigma_c = self.visual_uncertainty_estimator(mu_c)
 
@@ -176,7 +178,8 @@ class HUGModel(nn.Module):
         feat_t = self.blip_backbone.extract_text_features(
             input_ids=text_input_ids,
             attention_mask=text_attention_mask,
-            query_embeds=query_embeds
+            query_embeds=query_embeds,
+            mode=self.text_feature_mode
         )
         # feat_t = F.normalize(feat_t, dim=-1)
         sigma_t = self.text_uncertainty_estimator(feat_t)
@@ -192,12 +195,30 @@ class HUGModel(nn.Module):
             'sigma_q': sigma_q
         }
 
+    def extract_coordination_uncertainty(
+        self,
+        ref_pixel_values: torch.Tensor,
+        text_input_ids: torch.Tensor,
+        text_attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute only sigma_m for mismatched pairs, without unused heads."""
+        batch_size = ref_pixel_values.size(0)
+        query_embeds = self.query_tokens.expand(batch_size, -1, -1)
+        mu_m = self.blip_backbone.extract_multimodal_features(
+            pixel_values=ref_pixel_values,
+            input_ids=text_input_ids,
+            attention_mask=text_attention_mask,
+            query_embeds=query_embeds
+        )
+        return self.multimodal_uncertainty_estimator(mu_m)
+
     def forward(
         self,
         ref_pixel_values: torch.Tensor,
         text_input_ids: torch.Tensor,
         text_attention_mask: torch.Tensor,
-        target_pixel_values: torch.Tensor
+        target_pixel_values: torch.Tensor,
+        compute_uncertainty: bool = True
     ) -> Dict[str, torch.Tensor]:
         """
         Full forward pass for training.
@@ -211,6 +232,24 @@ class HUGModel(nn.Module):
         Returns:
             Dictionary containing all features and uncertainties needed for loss computation
         """
+        if not compute_uncertainty:
+            batch_size = ref_pixel_values.size(0)
+            query_embeds = self.query_tokens.expand(batch_size, -1, -1)
+            mu_q = self.blip_backbone.extract_multimodal_features(
+                pixel_values=ref_pixel_values,
+                input_ids=text_input_ids,
+                attention_mask=text_attention_mask,
+                query_embeds=query_embeds,
+            )
+            mu_c = self.blip_backbone.extract_image_features(
+                pixel_values=target_pixel_values,
+                query_embeds=query_embeds,
+            )
+            return {
+                'mu_q': mu_q, 'mu_c': mu_c,
+                'sigma_q': None, 'sigma_c': None, 'sigma_m': None,
+            }
+
         # Extract query side components
         query_components = self.extract_query_components(
             ref_pixel_values, text_input_ids, text_attention_mask
@@ -235,8 +274,9 @@ class HUGModel(nn.Module):
         self,
         ref_pixel_values: torch.Tensor,
         text_input_ids: torch.Tensor,
-        text_attention_mask: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        text_attention_mask: torch.Tensor,
+        compute_uncertainty: bool = True
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Encode query (reference image + modification text) for inference.
 
@@ -248,6 +288,17 @@ class HUGModel(nn.Module):
         Returns:
             (mu_q, sigma_q): Query mean and uncertainty
         """
+        if not compute_uncertainty:
+            batch_size = ref_pixel_values.size(0)
+            query_embeds = self.query_tokens.expand(batch_size, -1, -1)
+            mu_q = self.blip_backbone.extract_multimodal_features(
+                pixel_values=ref_pixel_values,
+                input_ids=text_input_ids,
+                attention_mask=text_attention_mask,
+                query_embeds=query_embeds,
+            )
+            return mu_q, None
+
         query_components = self.extract_query_components(
             ref_pixel_values, text_input_ids, text_attention_mask
         )
@@ -255,8 +306,9 @@ class HUGModel(nn.Module):
 
     def encode_target(
         self,
-        target_pixel_values: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        target_pixel_values: torch.Tensor,
+        compute_uncertainty: bool = True
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Encode target image for inference.
 
@@ -266,4 +318,12 @@ class HUGModel(nn.Module):
         Returns:
             (mu_c, sigma_c): Target mean and uncertainty
         """
+        if not compute_uncertainty:
+            batch_size = target_pixel_values.size(0)
+            query_embeds = self.query_tokens.expand(batch_size, -1, -1)
+            mu_c = self.blip_backbone.extract_image_features(
+                pixel_values=target_pixel_values,
+                query_embeds=query_embeds,
+            )
+            return mu_c, None
         return self.extract_target_features(target_pixel_values)

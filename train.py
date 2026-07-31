@@ -439,7 +439,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 from tqdm import tqdm
 try:
     import wandb
@@ -483,13 +483,13 @@ def parse_args():
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=32,
                        help='Batch size per GPU')
-    parser.add_argument('--num_epochs', type=int, default=1,
+    parser.add_argument('--num_epochs', type=int, default=30,
                        help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=3e-5,
                        help='Learning rate (Max LR for new heads)')
     parser.add_argument('--weight_decay', type=float, default=0.01,
                        help='Weight decay')
-    parser.add_argument('--warmup_epochs', type=int, default=2,
+    parser.add_argument('--warmup_epochs', type=int, default=0,
                        help='Number of warmup epochs')
 
     # Loss arguments
@@ -497,6 +497,14 @@ def parse_args():
                        help='Weight for fine-grained contrastive loss')
     parser.add_argument('--lambda_cord', type=float, default=0.1,
                        help='Weight for coordination loss')
+    parser.add_argument('--recipe', choices=['legacy', 'point', 'paper'], default='paper',
+                       help='Training objective and representation recipe')
+    parser.add_argument('--loss_lr_multiplier', type=float, default=100.0,
+                       help='LR multiplier for learnable loss scalars')
+    parser.add_argument('--init_checkpoint', type=str, default=None,
+                       help='Initialize model weights only (for point -> paper stage 2)')
+    parser.add_argument('--freeze_backbone', action='store_true',
+                       help='Freeze the pretrained BLIP/Q-Former mean encoder')
 
     # Other arguments
     parser.add_argument('--num_workers', type=int, default=4,
@@ -507,6 +515,8 @@ def parse_args():
                        help='Log every N steps')
     parser.add_argument('--save_interval', type=int, default=1,
                        help='Save checkpoint every N epochs')
+    parser.add_argument('--eval_every', type=int, default=1,
+                       help='Run validation every N epochs; 0 disables validation')
     parser.add_argument('--use_wandb', action='store_true',
                        help='Use Weights & Biases for logging')
     parser.add_argument('--seed', type=int, default=42,
@@ -566,7 +576,8 @@ def create_dataloader(args, split='train'):
         shuffle=(split == 'train'),
         num_workers=args.num_workers,
         collate_fn=collate_fn,
-        pin_memory=True
+        pin_memory=True,
+        drop_last=(split == 'train')
     )
 
     return dataloader
@@ -583,6 +594,10 @@ def train_one_epoch(
 ):
     """Train for one epoch"""
     model.train()
+    if args.freeze_backbone:
+        # Keep dropout disabled in the frozen mean encoder while uncertainty
+        # heads remain in training mode.
+        model.blip_backbone.eval()
 
     total_loss = 0
     total_loss_hc = 0
@@ -603,22 +618,21 @@ def train_one_epoch(
             ref_pixel_values=ref_images,
             text_input_ids=text_input_ids,
             text_attention_mask=text_attention_mask,
-            target_pixel_values=target_images
+            target_pixel_values=target_images,
+            compute_uncertainty=args.recipe != 'point'
         )
 
-        # For L_Cord, we need mismatched pairs
-        # Simple approach: shuffle text within batch
-        shuffled_indices = torch.randperm(text_input_ids.size(0))
-        mismatched_text_ids = text_input_ids[shuffled_indices]
-        mismatched_text_mask = text_attention_mask[shuffled_indices]
-
-        # Get sigma_m for mismatched pairs
-        mismatched_components = model.extract_query_components(
-            ref_pixel_values=ref_images,
-            text_input_ids=mismatched_text_ids,
-            text_attention_mask=mismatched_text_mask
-        )
-        sigma_m_mismatched = mismatched_components['sigma_m']
+        sigma_m_mismatched = None
+        if criterion.needs_mismatched:
+            # A random cyclic shift is a derangement: it never creates false matches.
+            batch_size = text_input_ids.size(0)
+            shift = torch.randint(1, batch_size, (), device=text_input_ids.device)
+            shuffled_indices = torch.arange(batch_size, device=text_input_ids.device).roll(shift.item())
+            sigma_m_mismatched = model.extract_coordination_uncertainty(
+                ref_pixel_values=ref_images,
+                text_input_ids=text_input_ids[shuffled_indices],
+                text_attention_mask=text_attention_mask[shuffled_indices]
+            )
 
         # Compute loss
         loss_dict = criterion(
@@ -635,7 +649,9 @@ def train_one_epoch(
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(
+            list(model.parameters()) + list(criterion.parameters()), max_norm=1.0
+        )
         optimizer.step()
 
         # Update statistics
@@ -695,6 +711,8 @@ def main():
     set_seed(args.seed)
 
     # Initialize wandb
+    if args.use_wandb and not HAS_WANDB:
+        raise RuntimeError("--use_wandb was set but wandb is not installed")
     if args.use_wandb:
         wandb.init(project='hug-cir', config=vars(args))
 
@@ -707,20 +725,48 @@ def main():
     train_loader = create_dataloader(args, split='train')
     print(f"Training samples: {len(train_loader.dataset)}")
 
+    val_loaders = None
+    if args.eval_every > 0:
+        from eval import create_retrieval_dataloaders, evaluate_retrieval
+        val_loaders = create_retrieval_dataloaders(args, split='val')
+        print(f"Validation queries: {len(val_loaders[0].dataset)}")
+
     # Create model
     print("Creating model...")
     model = HUGModel(
         num_queries=args.num_queries,
         hidden_dim=args.hidden_dim,
         blip_model_name=args.blip_model,
-        freeze_vision_encoder=True
+        freeze_vision_encoder=True,
+        text_feature_mode='legacy_tokens' if args.recipe == 'legacy' else 'query_tokens',
+        uncertainty_is_variance=args.recipe != 'legacy'
     ).to(device)
+
+    if args.init_checkpoint:
+        initial = torch.load(args.init_checkpoint, map_location=device)
+        model.load_state_dict(initial['model_state_dict'], strict=True)
+        print(f"Initialized model weights from {args.init_checkpoint}")
+
+    if args.freeze_backbone:
+        for param in model.blip_backbone.parameters():
+            param.requires_grad = False
+        model.query_tokens.requires_grad = False
+        print("Frozen BLIP/Q-Former backbone and query tokens")
 
     # Create loss function
     criterion = HUGLoss(
         lambda_fc=args.lambda_fc,
-        lambda_cord=args.lambda_cord
+        lambda_cord=args.lambda_cord,
+        recipe=args.recipe,
+        uncertainty_is_variance=args.recipe != 'legacy'
     ).to(device)
+    if args.recipe == 'point':
+        print(
+            "Loss recipe: point (symmetric mean-only InfoNCE); "
+            "Loss FC and Loss Cord are intentionally disabled."
+        )
+    else:
+        print(f"Loss recipe: {args.recipe} (HC + {args.lambda_fc}*FC + {args.lambda_cord}*Cord)")
 
     backbone_params = []
     head_params = []
@@ -737,39 +783,39 @@ def main():
             # Các head mới như Uncertainty Estimators, Dynamic Weighting...
             head_params.append(param)
 
-    # 2. Phân loại tham số từ CRITERION (Hàm Loss)
-    for name, param in criterion.named_parameters():
-        if not param.requires_grad:
-            continue
-            
-        if 'a' in name or 'b' in name:
-            # Tách riêng a và b để đẩy Learning Rate x100
-            loss_params.append(param)
-        else:
-            # Các tham số khác của loss (nếu có) gộp chung vào head_params
-            head_params.append(param)
+    # Learnable sigmoid scale/bias parameters belong to the criterion.
+    loss_params = [p for p in criterion.parameters() if p.requires_grad]
 
     # 3. Khởi tạo Optimizer
     optimizer = AdamW(
         [
-            {'params': backbone_params, 'lr': args.lr},            # LR cho backbone (hoặc args.lr * 0.1 nếu cần)
+            {'params': backbone_params, 'lr': args.lr},      # LR cho backbone (hoặc args.lr * 0.1 nếu cần)
             {'params': head_params, 'lr': args.lr},                # LR gốc cho các head
-            {'params': loss_params, 'lr': args.lr * 100}           # LR x100 cho a và b
+            {'params': loss_params, 'lr': args.lr * args.loss_lr_multiplier, 'weight_decay': 0.0}           # LR x100 cho a và b
         ],
         betas=(0.9, 0.999),
+        eps=1e-7,
         weight_decay=args.weight_decay
     )
     # =========================================================================
 
     # Create learning rate scheduler
     # CosineAnnealingLR sẽ tự động áp dụng decay cho TỪNG parameter group
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=args.num_epochs,
-        eta_min=1e-6
-    )
+    if args.warmup_epochs > 0:
+        if args.warmup_epochs >= args.num_epochs:
+            raise ValueError("warmup_epochs must be smaller than num_epochs")
+        warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=args.warmup_epochs)
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer, T_max=args.num_epochs - args.warmup_epochs, eta_min=1e-6
+        )
+        scheduler = SequentialLR(
+            optimizer, [warmup_scheduler, cosine_scheduler], [args.warmup_epochs]
+        )
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
 
     # Training loop
+    best_score = float("-inf")
     print("Starting training...")
     for epoch in range(1, args.num_epochs + 1):
         # Train one epoch
@@ -793,6 +839,30 @@ def main():
                 'train/epoch_loss_cord': train_metrics['loss_cord'],
                 'train/epoch': epoch
             })
+
+        if val_loaders is not None and epoch % args.eval_every == 0:
+            query_loader, gallery_loader, gallery_id_to_idx = val_loaders
+            val_metrics = evaluate_retrieval(
+                model, query_loader, gallery_loader, gallery_id_to_idx,
+                device, distance_mode="mean" if args.recipe == "point" else "probabilistic"
+            )
+            val_score = 0.5 * (val_metrics['recall@10'] + val_metrics['recall@50'])
+            print(
+                f"  Val R@10: {val_metrics['recall@10']:.2f} | "
+                f"R@50: {val_metrics['recall@50']:.2f} | Avg: {val_score:.2f}"
+            )
+            if args.use_wandb:
+                wandb.log({
+                    'val/recall@10': val_metrics['recall@10'],
+                    'val/recall@50': val_metrics['recall@50'],
+                    'val/avg_recall': val_score,
+                    'val/epoch': epoch,
+                })
+            if val_score > best_score:
+                best_score = val_score
+                save_checkpoint(model, optimizer, epoch, args, 'checkpoint_best.pth')
+                print(f"  New best validation checkpoint (Avg={best_score:.2f})")
+            model.train()
 
         # Update learning rate
         scheduler.step()

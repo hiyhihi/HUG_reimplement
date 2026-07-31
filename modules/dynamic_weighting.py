@@ -22,13 +22,14 @@ class DynamicWeighting(nn.Module):
     Ã_q² = w_r·Ã_r² + w_t·Ã_t² + w_m·Ã_m²
     """
 
-    def __init__(self, eps: float = 1e-6):
+    def __init__(self, eps: float = 1e-6, input_is_variance: bool = False):
         """
         Args:
             eps: Small epsilon value for numerical stability
         """
         super().__init__()
         self.eps = eps
+        self.input_is_variance = input_is_variance
 
     def forward(
         self,
@@ -51,10 +52,13 @@ class DynamicWeighting(nn.Module):
             sigma_q: Combined query uncertainty
                     Shape: [batch_size, num_queries, hidden_dim]
         """
-        # Compute squared uncertainties
-        sigma_r_sq = sigma_r ** 2
-        sigma_t_sq = sigma_t ** 2
-        sigma_m_sq = sigma_m ** 2
+        # The paper defines estimator outputs as variances (sigma^2).
+        if self.input_is_variance:
+            sigma_r_sq, sigma_t_sq, sigma_m_sq = sigma_r, sigma_t, sigma_m
+        else:
+            sigma_r_sq = sigma_r ** 2
+            sigma_t_sq = sigma_t ** 2
+            sigma_m_sq = sigma_m ** 2
 
         # Compute unnormalized weights using exp(-Ã²)
         # Lower uncertainty -> Higher weight
@@ -71,10 +75,9 @@ class DynamicWeighting(nn.Module):
         # Combine uncertainties using dynamic weights (Equation 10)
         sigma_q_sq = w_r * sigma_r_sq + w_t * sigma_t_sq + w_m * sigma_m_sq
 
-        # Return standard deviation (not variance)
-        sigma_q = torch.sqrt(sigma_q_sq + self.eps)
-
-        return sigma_q
+        if self.input_is_variance:
+            return sigma_q_sq
+        return torch.sqrt(sigma_q_sq + self.eps)
 
     def get_weights(
         self,
@@ -89,9 +92,12 @@ class DynamicWeighting(nn.Module):
         Returns:
             (w_r, w_t, w_m): Normalized weights for each modality
         """
-        sigma_r_sq = sigma_r ** 2
-        sigma_t_sq = sigma_t ** 2
-        sigma_m_sq = sigma_m ** 2
+        if self.input_is_variance:
+            sigma_r_sq, sigma_t_sq, sigma_m_sq = sigma_r, sigma_t, sigma_m
+        else:
+            sigma_r_sq = sigma_r ** 2
+            sigma_t_sq = sigma_t ** 2
+            sigma_m_sq = sigma_m ** 2
 
         w_r_unnorm = torch.exp(-sigma_r_sq)
         w_t_unnorm = torch.exp(-sigma_t_sq)

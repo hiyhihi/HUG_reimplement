@@ -203,272 +203,198 @@ from typing import Optional
 
 #         return loss
 
-def uncertainty_aware_distance(mu_q, sigma_q, mu_c, sigma_c, aggregate=True, **kwargs):
-    # 1. BẮT BUỘC: Chuẩn hóa L2 trên chiều D (768) để giới hạn ||mu|| = 1
-    mu_q_norm = F.normalize(mu_q, p=2, dim=-1)
-    mu_c_norm = F.normalize(mu_c, p=2, dim=-1)
+def _as_variance(uncertainty: torch.Tensor, uncertainty_is_variance: bool) -> torch.Tensor:
+    """Convert a legacy standard deviation or a paper-style variance to variance."""
+    return uncertainty if uncertainty_is_variance else uncertainty.square()
 
-    mu_q_exp = mu_q_norm.unsqueeze(1)    # [B, 1, K, D]
-    mu_c_exp = mu_c_norm.unsqueeze(0)    # [1, B, K, D]
-    sigma_q_exp = sigma_q.unsqueeze(1)   # [B, 1, K, D]
-    sigma_c_exp = sigma_c.unsqueeze(0)   # [1, B, K, D]
 
-    # 2. TÍNH TOÁN KHOẢNG CÁCH CHUẨN MỰC
-    # Phía mu: Vẫn dùng .sum(dim=-1) để lấy khoảng cách hình học chuẩn [0, 4]
-    mean_distance = ((mu_q_exp - mu_c_exp) ** 2).sum(dim=-1).mean(dim=-1)
+def pairwise_uncertainty_distance(
+    mu_q: torch.Tensor,
+    sigma_q: torch.Tensor,
+    mu_c: torch.Tensor,
+    sigma_c: torch.Tensor,
+    uncertainty_is_variance: bool = False,
+    include_uncertainty: bool = True,
+) -> torch.Tensor:
+    """Vectorized normalized version of Eq. 15 for arbitrary Q x C inputs."""
+    if mu_q.ndim != 3 or mu_c.ndim != 3:
+        raise ValueError("mu_q and mu_c must have shape [N, K, D]")
+    if mu_q.shape[1:] != mu_c.shape[1:]:
+        raise ValueError("query and candidate feature shapes must match")
+    q = F.normalize(mu_q.float(), p=2, dim=-1)
+    c = F.normalize(mu_c.float(), p=2, dim=-1)
+    num_components = q.size(1)
+    similarity = q.flatten(1) @ c.flatten(1).T / num_components
+    mean_distance = (2.0 - 2.0 * similarity).clamp_min(0.0)
+    if not include_uncertainty:
+        return mean_distance
+    var_q = _as_variance(sigma_q.float(), uncertainty_is_variance).mean(dim=(-2, -1))
+    var_c = _as_variance(sigma_c.float(), uncertainty_is_variance).mean(dim=(-2, -1))
+    return mean_distance + var_q[:, None] + var_c[None, :]
 
-    # ĐÂY LÀ ĐIỂM SỬA QUYẾT ĐỊNH: 
-    # Phía sigma: BẮT BUỘC dùng .mean(dim=-1) thay vì .sum(dim=-1) 
-    # Để tránh việc sigma bị nhân lên 768 lần và đè bẹp mu
-    sigma_q_norm_dist = (sigma_q_exp ** 2).mean(dim=-1).mean(dim=-1)
-    sigma_c_norm_dist = (sigma_c_exp ** 2).mean(dim=-1).mean(dim=-1)
 
-    # Lưu lại để debug
-    global DEBUG_MEAN_DIST, DEBUG_SIGMA_DIST
-    DEBUG_MEAN_DIST = mean_distance.detach()
-    DEBUG_SIGMA_DIST = (sigma_q_norm_dist + sigma_c_norm_dist).detach()
+def uncertainty_aware_distance(
+    mu_q: torch.Tensor,
+    sigma_q: torch.Tensor,
+    mu_c: torch.Tensor,
+    sigma_c: torch.Tensor,
+    aggregate: bool = True,
+    uncertainty_is_variance: bool = False,
+    include_uncertainty: bool = True,
+    **kwargs,
+) -> torch.Tensor:
+    """Backward-compatible public distance function."""
+    del aggregate, kwargs
+    return pairwise_uncertainty_distance(
+        mu_q, sigma_q, mu_c, sigma_c,
+        uncertainty_is_variance=uncertainty_is_variance,
+        include_uncertainty=include_uncertainty,
+    )
 
-    return mean_distance + sigma_q_norm_dist + sigma_c_norm_dist
 
 class HolisticContrastiveLoss(nn.Module):
-    # Giữ nguyên a=2.0, b=-5.0 vì scale [0, 4] rất khớp với mức này
-    def __init__(self, init_a: float = 2.0, init_b: float = -5.0): 
+    """Sigmoid holistic contrast with legacy and paper-compatible variants."""
+    def __init__(
+        self, init_a=2.0, init_b=-5.0, symmetric=False,
+        uncertainty_is_variance=False,
+    ):
         super().__init__()
         self.a = nn.Parameter(torch.tensor(init_a, dtype=torch.float32))
         self.b = nn.Parameter(torch.tensor(init_b, dtype=torch.float32))
+        self.symmetric = symmetric
+        self.uncertainty_is_variance = uncertainty_is_variance
 
     def forward(self, mu_q, sigma_q, mu_c, sigma_c):
-        batch_size = mu_q.size(0)
-        distances = uncertainty_aware_distance(mu_q, sigma_q, mu_c, sigma_c)
-
-        positive_distances = torch.diag(distances)
+        distances = pairwise_uncertainty_distance(
+            mu_q, sigma_q, mu_c, sigma_c,
+            uncertainty_is_variance=self.uncertainty_is_variance,
+        )
+        batch_size = distances.size(0)
+        if batch_size < 2:
+            raise ValueError("Holistic contrast requires batch_size >= 2")
+        positive_loss = F.softplus(self.a * distances.diagonal() + self.b).mean()
         mask = ~torch.eye(batch_size, dtype=torch.bool, device=distances.device)
-        negative_distances = distances[mask].view(batch_size, batch_size - 1)
-        
-        loss_pos = F.softplus(self.a * positive_distances + self.b) 
-        loss_neg_matrix = F.softplus(-self.a * negative_distances - self.b)
-        
-        # Bắt buộc Sum để cộng hưởng lực đẩy
-        loss_neg = loss_neg_matrix.sum(dim=1) 
+        negative_loss = F.softplus(-self.a * distances - self.b).masked_fill(~mask, 0)
+        row_loss = negative_loss.sum(dim=1).mean()
+        if not self.symmetric:
+            return positive_loss + row_loss
+        return positive_loss + row_loss + negative_loss.sum(dim=0).mean()
 
-        loss = (loss_pos + loss_neg).mean()
 
-        with torch.no_grad():
-            global DEBUG_MEAN_DIST, DEBUG_SIGMA_DIST
-            pos_mean_dist = torch.diag(DEBUG_MEAN_DIST).mean().item()
-            pos_sigma_dist = torch.diag(DEBUG_SIGMA_DIST).mean().item()
-            
-            print(f"\n===== HC DEBUG =====")
-            print(f"pos_dist (Total) : {positive_distances.mean().item():.4f}")
-            print(f"neg_dist (Total) : {negative_distances.mean().item():.4f}")
-            print(f"--> Semantic (mu)  : {pos_mean_dist:.4f} (Max 4.0)")
-            print(f"--> Cheat (sigma)  : {pos_sigma_dist:.4f}")
-            print(f"a: {self.a.item():.4f} | b: {self.b.item():.4f}")
-
-        return loss
-
-class FineGrainedContrastiveLoss(nn.Module):
-    """
-    Fine-Grained Contrastive Loss (L_FC).
-
-    According to Equation (16), this loss applies contrastive learning
-    to each of the K Gaussian distributions independently, using three
-    types of negative sampling:
-    - Component-wise: Different k' within the same sample
-    - Instance-wise: Same k from different samples
-    - Modality-wise: Cross-modal negatives (query vs target)
-    """
-
+class PointContrastiveLoss(nn.Module):
+    """Symmetric InfoNCE baseline on the 32 aligned Q-Former mean tokens."""
     def __init__(self, temperature: float = 0.07):
-        """
-        Args:
-            temperature: Temperature parameter for contrastive loss
-        """
         super().__init__()
         self.temperature = temperature
 
-    def forward(
-        self,
-        sigma_q: torch.Tensor,
-        sigma_c: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute fine-grained contrastive loss.
+    def forward(self, mu_q, mu_c):
+        q = F.normalize(mu_q.float(), dim=-1)
+        c = F.normalize(mu_c.float(), dim=-1)
+        logits = torch.einsum('bkd,ckd->bc', q, c) / (q.size(1) * self.temperature)
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
 
-        Args:
-            sigma_q: Query uncertainty [batch_size, num_queries, hidden_dim]
-            sigma_c: Target uncertainty [batch_size, num_queries, hidden_dim]
 
-        Returns:
-            loss: Scalar loss value
-        """
-        batch_size, num_queries, hidden_dim = sigma_q.shape
+class LegacyFineGrainedContrastiveLoss(nn.Module):
+    """Vectorized equivalent of the historical InfoNCE uncertainty loss."""
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
 
-        total_loss = 0
-        num_positives = 0
+    def forward(self, sigma_q, sigma_c):
+        q = F.normalize(sigma_q.float(), dim=-1)
+        c = F.normalize(sigma_c.float(), dim=-1)
+        batch_size, num_components, _ = q.shape
+        pos = (q * c).sum(dim=-1, keepdim=True)
+        same_q = torch.einsum('bkd,bjd->bkj', q, q)
+        same_c = torch.einsum('bkd,bjd->bkj', q, c)
+        offdiag = ~torch.eye(num_components, dtype=torch.bool, device=q.device)
+        neg_q = same_q[:, offdiag].view(batch_size, num_components, num_components - 1)
+        neg_c = same_c[:, offdiag].view(batch_size, num_components, num_components - 1)
+        logits = torch.cat([pos, neg_q, neg_c], dim=-1) / self.temperature
+        component_loss = F.cross_entropy(
+            logits.flatten(0, 1),
+            torch.zeros(batch_size * num_components, dtype=torch.long, device=q.device),
+        )
+        instance_logits = torch.einsum('bkd,ckd->kbc', q, c) / self.temperature
+        labels = torch.arange(batch_size, device=q.device).expand(num_components, -1)
+        instance_loss = F.cross_entropy(instance_logits.flatten(0, 1), labels.flatten())
+        return (batch_size * component_loss + instance_loss) / (batch_size + 1)
 
-        # Iterate over each Gaussian component (k)
-        for k in range(num_queries):
-            # Get the k-th component for all samples
-            sigma_q_k = sigma_q[:, k, :]  # [batch_size, hidden_dim]
-            sigma_c_k = sigma_c[:, k, :]  # [batch_size, hidden_dim]
 
-            # Normalize features
-            sigma_q_k_norm = F.normalize(sigma_q_k, dim=-1)
-            sigma_c_k_norm = F.normalize(sigma_c_k, dim=-1)
+FineGrainedContrastiveLoss = LegacyFineGrainedContrastiveLoss
 
-            # 1. Component-wise negatives: other k' from the same sample
-            # For each sample, contrast k-th component with all other components
-            for i in range(batch_size):
-                # Anchor: k-th component of query i
-                anchor = sigma_q_k_norm[i:i+1]  # [1, hidden_dim]
 
-                # Positive: k-th component of target i
-                positive = sigma_c_k_norm[i:i+1]  # [1, hidden_dim]
+class PaperFineGrainedContrastiveLoss(nn.Module):
+    """Eq. 16 using component-, instance-, and modality-wise negatives."""
+    def __init__(self, init_a: float = 1.0, init_b: float = 0.0):
+        super().__init__()
+        self.a_prime = nn.Parameter(torch.tensor(init_a, dtype=torch.float32))
+        self.b_prime = nn.Parameter(torch.tensor(init_b, dtype=torch.float32))
 
-                # Negatives: all other components from query i and target i
-                neg_q = sigma_q[i, :, :]  # [num_queries, hidden_dim]
-                neg_c = sigma_c[i, :, :]  # [num_queries, hidden_dim]
-                negatives = torch.cat([neg_q, neg_c], dim=0)  # [2*num_queries, hidden_dim]
-                negatives_norm = F.normalize(negatives, dim=-1)
-
-                # Remove the positive component from negatives
-                # Keep all except k-th from query and k-th from target
-                neg_mask = torch.ones(2 * num_queries, dtype=torch.bool, device=sigma_q.device)
-                neg_mask[k] = False  # Remove k-th from query side
-                neg_mask[num_queries + k] = False  # Remove k-th from target side
-                negatives_filtered = negatives_norm[neg_mask]
-
-                # Compute similarities
-                pos_sim = torch.sum(anchor * positive, dim=-1) / self.temperature
-                neg_sim = torch.matmul(anchor, negatives_filtered.T) / self.temperature
-
-                # InfoNCE loss
-                logits = torch.cat([pos_sim, neg_sim.squeeze(0)])
-                labels = torch.zeros(1, dtype=torch.long, device=sigma_q.device)
-                loss = F.cross_entropy(logits.unsqueeze(0), labels)
-
-                total_loss += loss
-                num_positives += 1
-
-            # 2. Instance-wise negatives: same k from different samples (in-batch)
-            # Use standard InfoNCE with batch samples
-            similarities = torch.matmul(sigma_q_k_norm, sigma_c_k_norm.T) / self.temperature
-            labels = torch.arange(batch_size, device=sigma_q.device)
-            loss_instance = F.cross_entropy(similarities, labels)
-            total_loss += loss_instance
-
-        # Average over all positives
-        avg_loss = total_loss / (num_positives + num_queries)
-
-        return avg_loss
+    def forward(self, sigma_q, sigma_c):
+        vectors = torch.cat([sigma_q, sigma_c], dim=0).float().flatten(0, 1)
+        vectors = F.normalize(vectors, dim=-1)
+        distances = (2.0 - 2.0 * (vectors @ vectors.T)).clamp_min(0.0)
+        mask = ~torch.eye(distances.size(0), dtype=torch.bool, device=distances.device)
+        return F.softplus(-self.a_prime * distances[mask] - self.b_prime).mean()
 
 
 class MultiModalCoordinationLoss(nn.Module):
-    """
-    Multi-Modal Coordination Loss (L_Cord).
-
-    According to Equation (9), this is a ranking loss that ensures
-    matched (image, text) pairs have lower coordination uncertainty
-    than mismatched pairs.
-
-    L_Cord = max(0, margin + ||Ã_m(matched)||Â² - ||Ã_m(mismatched)||Â²)
-    """
-
-    def __init__(self, margin: float = 0.2):
-        """
-        Args:
-            margin: Margin for ranking loss
-        """
+    """Matched image-text pairs must have lower variance than deranged pairs."""
+    def __init__(self, margin=0.2, uncertainty_is_variance=False, use_sigmoid=False):
         super().__init__()
         self.margin = margin
+        self.uncertainty_is_variance = uncertainty_is_variance
+        self.use_sigmoid = use_sigmoid
 
-    def forward(
-        self,
-        sigma_m_matched: torch.Tensor,
-        sigma_m_mismatched: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute multi-modal coordination loss.
-
-        Args:
-            sigma_m_matched: Coordination uncertainty for matched pairs
-                            [batch_size, num_queries, hidden_dim]
-            sigma_m_mismatched: Coordination uncertainty for mismatched pairs
-                               [batch_size, num_queries, hidden_dim]
-
-        Returns:
-            loss: Scalar loss value
-        """
-        # Compute L2 norm squared of coordination uncertainties
-        matched_norm = torch.mean(sigma_m_matched ** 2, dim=(-2, -1))  # [batch_size]
-        mismatched_norm = torch.mean(sigma_m_mismatched ** 2, dim=(-2, -1))  # [batch_size]
-
-        # Ranking loss: matched should have lower uncertainty than mismatched
-        loss = torch.mean(torch.clamp(self.margin + matched_norm - mismatched_norm, min=0))
-
-        return loss
+    def forward(self, sigma_m_matched, sigma_m_mismatched):
+        matched = _as_variance(sigma_m_matched.float(), self.uncertainty_is_variance).mean(dim=(-2, -1))
+        mismatched = _as_variance(sigma_m_mismatched.float(), self.uncertainty_is_variance).mean(dim=(-2, -1))
+        if self.use_sigmoid:
+            return F.softplus(matched - mismatched).mean()
+        return F.relu(self.margin + matched - mismatched).mean()
 
 
 class HUGLoss(nn.Module):
-    """
-    Combined HUG loss: L_HUG = L_HC + lambda_FC * L_FC + lambda_Cord * L_Cord
-
-    Args:
-        lambda_fc: Weight for fine-grained contrastive loss (default: 0.5)
-        lambda_cord: Weight for coordination loss (default: 0.1)
-    """
-
+    """Selectable objective for faithful ablations and legacy reproduction."""
     def __init__(
-        self,
-        lambda_fc: float = 0.5,
-        lambda_cord: float = 0.1,
-        margin_cord: float = 0.2,
-        temperature_fc: float = 0.07
+        self, lambda_fc=0.5, lambda_cord=0.1, margin_cord=0.2,
+        temperature_fc=0.07, recipe="paper", uncertainty_is_variance=True,
     ):
         super().__init__()
-
+        if recipe not in {"legacy", "point", "paper"}:
+            raise ValueError(f"Unknown loss recipe: {recipe}")
+        self.recipe = recipe
         self.lambda_fc = lambda_fc
         self.lambda_cord = lambda_cord
-
-        self.loss_hc = HolisticContrastiveLoss()
-        self.loss_fc = FineGrainedContrastiveLoss(temperature=temperature_fc)
-        self.loss_cord = MultiModalCoordinationLoss(margin=margin_cord)
+        self.needs_mismatched = recipe != "point"
+        if recipe == "point":
+            self.loss_point = PointContrastiveLoss(temperature_fc)
+        elif recipe == "legacy":
+            self.loss_hc = HolisticContrastiveLoss(2.0, -5.0, False, False)
+            self.loss_fc = LegacyFineGrainedContrastiveLoss(temperature_fc)
+            self.loss_cord = MultiModalCoordinationLoss(margin_cord, False, False)
+        else:
+            self.loss_hc = HolisticContrastiveLoss(1.0, 0.0, True, uncertainty_is_variance)
+            self.loss_fc = PaperFineGrainedContrastiveLoss()
+            self.loss_cord = MultiModalCoordinationLoss(0.0, uncertainty_is_variance, True)
 
     def forward(
-        self,
-        mu_q: torch.Tensor,
-        sigma_q: torch.Tensor,
-        mu_c: torch.Tensor,
-        sigma_c: torch.Tensor,
-        sigma_m_matched: torch.Tensor,
-        sigma_m_mismatched: torch.Tensor
-    ) -> dict:
-        """
-        Compute total HUG loss and individual loss components.
-
-        Args:
-            mu_q: Query mean
-            sigma_q: Query uncertainty
-            mu_c: Target mean
-            sigma_c: Target uncertainty
-            sigma_m_matched: Coordination uncertainty for matched pairs
-            sigma_m_mismatched: Coordination uncertainty for mismatched pairs
-
-        Returns:
-            Dictionary containing total loss and individual components
-        """
-        # Compute individual losses
+        self, mu_q, sigma_q, mu_c, sigma_c,
+        sigma_m_matched=None, sigma_m_mismatched=None,
+    ):
+        if self.recipe == "point":
+            total = self.loss_point(mu_q, mu_c)
+            zero = total.detach().new_zeros(())
+            return {'total_loss': total, 'loss_hc': total.detach(), 'loss_fc': zero, 'loss_cord': zero}
+        if sigma_m_matched is None or sigma_m_mismatched is None:
+            raise ValueError(f"{self.recipe} recipe requires matched and mismatched sigma_m")
         l_hc = self.loss_hc(mu_q, sigma_q, mu_c, sigma_c)
         l_fc = self.loss_fc(sigma_q, sigma_c)
         l_cord = self.loss_cord(sigma_m_matched, sigma_m_mismatched)
-
-        # Total loss
-        total_loss = l_hc + self.lambda_fc * l_fc + self.lambda_cord * l_cord
-
+        total = l_hc + self.lambda_fc * l_fc + self.lambda_cord * l_cord
         return {
-            'total_loss': total_loss,
-            'loss_hc': l_hc.detach(),
-            'loss_fc': l_fc.detach(),
-            'loss_cord': l_cord.detach()
+            'total_loss': total, 'loss_hc': l_hc.detach(),
+            'loss_fc': l_fc.detach(), 'loss_cord': l_cord.detach(),
         }

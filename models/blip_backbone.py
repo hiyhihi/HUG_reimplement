@@ -388,7 +388,8 @@ class BLIPBackbone(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        query_embeds: Optional[torch.Tensor] = None
+        query_embeds: Optional[torch.Tensor] = None,
+        mode: str = "query_tokens"
     ) -> torch.Tensor:
         """
         Extract features from text only (HUG-compatible interface).
@@ -405,7 +406,37 @@ class BLIPBackbone(nn.Module):
         Returns:
             text_embeds: CLS token expanded to 32 tokens [batch, 32, 768]
         """
-        # Convert input_ids back to text for LAVIS processor
+        if mode not in {"query_tokens", "legacy_tokens"}:
+            raise ValueError(f"Unknown text feature mode: {mode}")
+
+        if mode == "query_tokens":
+            if query_embeds is None:
+                query_embeds = self.blip_model.query_tokens.expand(input_ids.size(0), -1, -1)
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+            query_atts = torch.ones(query_embeds.size()[:-1], dtype=torch.long, device=input_ids.device)
+            attention_mask_all = torch.cat([query_atts, attention_mask], dim=1)
+
+            # Q-Former inserts cross-attention layers whenever query tokens are
+            # present. Text-only HUG features correspond to h([LQ], text, empty),
+            # so provide one zero-valued encoder token as the empty visual context.
+            encoder_width = self.blip_model.Qformer.config.encoder_width
+            empty_context = query_embeds.new_zeros(
+                input_ids.size(0), 1, encoder_width
+            )
+            empty_context_mask = torch.ones(
+                input_ids.size(0), 1, dtype=torch.long, device=input_ids.device
+            )
+            output = self.blip_model.Qformer.bert(
+                input_ids, query_embeds=query_embeds,
+                attention_mask=attention_mask_all,
+                encoder_hidden_states=empty_context,
+                encoder_attention_mask=empty_context_mask,
+                return_dict=True
+            )
+            return output.last_hidden_state[:, :query_embeds.size(1), :]
+
+        # Legacy path retained to reproduce the historical ~6x runs.
         texts = []
         for ids in input_ids:
             text = self.tokenizer.decode(ids, skip_special_tokens=True)

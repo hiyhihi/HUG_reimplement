@@ -213,3 +213,4 @@ results/
 wandb/
 ref/
 /.env
+/zip_tool.py

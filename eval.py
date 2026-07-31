@@ -21,7 +21,7 @@ from tqdm import tqdm
 import json
 
 from models import HUGModel
-from modules import CIRMetrics, uncertainty_aware_distance
+from modules import CIRMetrics, uncertainty_aware_distance, pairwise_uncertainty_distance
 from data import (
     FashionIQDataset, FashionIQQueryDataset, FashionIQGalleryDataset,
     CIRRDataset, CIRRQueryDataset, CIRRGalleryDataset,
@@ -55,6 +55,8 @@ def parse_args():
                        help='Path to model checkpoint')
     parser.add_argument('--batch_size', type=int, default=64,
                        help='Batch size for evaluation')
+    parser.add_argument('--distance_mode', choices=['probabilistic', 'mean'],
+                       default='probabilistic', help='Ranking distance to report')
 
     # Other arguments
     parser.add_argument('--num_workers', type=int, default=4,
@@ -78,7 +80,9 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
         num_queries=model_args.get('num_queries', 32),
         hidden_dim=model_args.get('hidden_dim', 768),
         blip_model_name=model_args.get('blip_model', 'pretrain'),
-        freeze_vision_encoder=True
+        freeze_vision_encoder=True,
+        text_feature_mode=model_args.get('text_feature_mode', 'legacy_tokens' if model_args.get('recipe', 'legacy') == 'legacy' else 'query_tokens'),
+        uncertainty_is_variance=model_args.get('uncertainty_is_variance', model_args.get('recipe', 'legacy') != 'legacy')
     ).to(device)
 
     # Load state dict
@@ -221,7 +225,12 @@ def create_retrieval_dataloaders(args, split='val'):
 
 
 @torch.no_grad()
-def extract_query_features(model: nn.Module, dataloader: DataLoader, device: torch.device):
+def extract_query_features(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    compute_uncertainty: bool = True,
+):
     """
     Extract query features (reference image + text).
 
@@ -243,23 +252,30 @@ def extract_query_features(model: nn.Module, dataloader: DataLoader, device: tor
         mu_q, sigma_q = model.encode_query(
             ref_pixel_values=ref_images,
             text_input_ids=text_input_ids,
-            text_attention_mask=text_attention_mask
+            text_attention_mask=text_attention_mask,
+            compute_uncertainty=compute_uncertainty,
         )
 
         query_mu_list.append(mu_q.cpu())
-        query_sigma_list.append(sigma_q.cpu())
+        if sigma_q is not None:
+            query_sigma_list.append(sigma_q.cpu())
         target_ids_list.extend(batch['target_ids'])
         candidate_ids_list.extend(batch.get('candidate_ids', batch['target_ids']))  # Fallback for compatibility
 
     # Concatenate all features
     query_mu = torch.cat(query_mu_list, dim=0)
-    query_sigma = torch.cat(query_sigma_list, dim=0)
+    query_sigma = torch.cat(query_sigma_list, dim=0) if query_sigma_list else None
 
     return query_mu, query_sigma, target_ids_list, candidate_ids_list
 
 
 @torch.no_grad()
-def extract_gallery_features(model: nn.Module, dataloader: DataLoader, device: torch.device):
+def extract_gallery_features(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    compute_uncertainty: bool = True,
+):
     """
     Extract gallery image features.
 
@@ -275,15 +291,19 @@ def extract_gallery_features(model: nn.Module, dataloader: DataLoader, device: t
         images = batch['images'].to(device)
 
         # Encode target image
-        mu_c, sigma_c = model.encode_target(target_pixel_values=images)
+        mu_c, sigma_c = model.encode_target(
+            target_pixel_values=images,
+            compute_uncertainty=compute_uncertainty,
+        )
 
         gallery_mu_list.append(mu_c.cpu())
-        gallery_sigma_list.append(sigma_c.cpu())
+        if sigma_c is not None:
+            gallery_sigma_list.append(sigma_c.cpu())
         gallery_ids_list.extend(batch['image_ids'])
 
     # Concatenate all features
     gallery_mu = torch.cat(gallery_mu_list, dim=0)
-    gallery_sigma = torch.cat(gallery_sigma_list, dim=0)
+    gallery_sigma = torch.cat(gallery_sigma_list, dim=0) if gallery_sigma_list else None
 
     return gallery_mu, gallery_sigma, gallery_ids_list
 
@@ -338,54 +358,41 @@ def extract_all_features(model: nn.Module, dataloader: DataLoader, device: torch
     }
 
 
-def compute_distance_matrix(features: dict, device: torch.device):
-    """
-    Compute pairwise distance matrix using uncertainty-aware distance.
-
-    Args:
-        features: Dictionary with query and target features
-
-    Returns:
-        Distance matrix of shape [num_queries, num_targets]
-    """
-    query_mu = features['query_mu']
-    query_sigma = features['query_sigma']
-    target_mu = features['target_mu']
-    target_sigma = features['target_sigma']
-
-    num_queries = query_mu.size(0)
-    num_targets = target_mu.size(0)
-
+def compute_pairwise_distance_matrix(
+    query_mu, query_sigma, target_mu, target_sigma, device,
+    uncertainty_is_variance=False, include_uncertainty=True, chunk_size=256,
+):
+    """Compute retrieval distances with matrix products instead of Python QxG loops."""
+    num_queries, num_targets = query_mu.size(0), target_mu.size(0)
+    distance_matrix = torch.empty(num_queries, num_targets)
     print(f"Computing distance matrix ({num_queries} x {num_targets})...")
-
-    # Compute distances in batches to avoid OOM
-    batch_size = 100
-    distance_matrix = torch.zeros(num_queries, num_targets)
-
-    for i in tqdm(range(0, num_queries, batch_size)):
-        end_i = min(i + batch_size, num_queries)
-        batch_query_mu = query_mu[i:end_i].to(device)
-        batch_query_sigma = query_sigma[i:end_i].to(device)
-
-        for j in range(0, num_targets, batch_size):
-            end_j = min(j + batch_size, num_targets)
-            batch_target_mu = target_mu[j:end_j].to(device)
-            batch_target_sigma = target_sigma[j:end_j].to(device)
-
-            # Compute pairwise distances
-            for qi in range(batch_query_mu.size(0)):
-                for ti in range(batch_target_mu.size(0)):
-                    dist = uncertainty_aware_distance(
-                        batch_query_mu[qi:qi+1],
-                        batch_query_sigma[qi:qi+1],
-                        batch_target_mu[ti:ti+1],
-                        batch_target_sigma[ti:ti+1],
-                        aggregate=True
-                    )
-                    distance_matrix[i + qi, j + ti] = dist.item()
-
+    for i in tqdm(range(0, num_queries, chunk_size)):
+        qi = slice(i, min(i + chunk_size, num_queries))
+        q_mu = query_mu[qi].to(device)
+        q_sigma = query_sigma[qi].to(device) if include_uncertainty else None
+        for j in range(0, num_targets, chunk_size):
+            tj = slice(j, min(j + chunk_size, num_targets))
+            distances = pairwise_uncertainty_distance(
+                q_mu, q_sigma,
+                target_mu[tj].to(device),
+                target_sigma[tj].to(device) if include_uncertainty else None,
+                uncertainty_is_variance=uncertainty_is_variance,
+                include_uncertainty=include_uncertainty,
+            )
+            distance_matrix[qi, tj] = distances.cpu()
     return distance_matrix
 
+
+def compute_distance_matrix(
+    features: dict, device: torch.device,
+    uncertainty_is_variance=False, include_uncertainty=True,
+):
+    return compute_pairwise_distance_matrix(
+        features['query_mu'], features['query_sigma'],
+        features['target_mu'], features['target_sigma'], device,
+        uncertainty_is_variance=uncertainty_is_variance,
+        include_uncertainty=include_uncertainty,
+    )
 
 def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device):
     """
@@ -400,7 +407,10 @@ def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device):
     features = extract_all_features(model, dataloader, device)
 
     # Compute distance matrix
-    distance_matrix = compute_distance_matrix(features, device)
+    distance_matrix = compute_distance_matrix(
+        features, device,
+        uncertainty_is_variance=getattr(model, 'uncertainty_is_variance', False)
+    )
 
     # Compute metrics
     metric_computer = CIRMetrics(
@@ -415,7 +425,7 @@ def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device):
 
 def evaluate_retrieval(model: nn.Module, query_loader: DataLoader,
                        gallery_loader: DataLoader, gallery_id_to_idx: dict,
-                       device: torch.device):
+                       device: torch.device, distance_mode: str = "probabilistic"):
     """
     Evaluate model using retrieval setup (query → gallery).
 
@@ -437,43 +447,28 @@ def evaluate_retrieval(model: nn.Module, query_loader: DataLoader,
     """
     model.eval()
 
+    include_uncertainty = distance_mode == "probabilistic"
+
     # Extract query features (reference + text)
-    query_mu, query_sigma, target_ids, candidate_ids = extract_query_features(model, query_loader, device)
+    query_mu, query_sigma, target_ids, candidate_ids = extract_query_features(
+        model, query_loader, device,
+        compute_uncertainty=include_uncertainty,
+    )
 
     # Extract gallery features (all images)
-    gallery_mu, gallery_sigma, gallery_ids = extract_gallery_features(model, gallery_loader, device)
+    gallery_mu, gallery_sigma, gallery_ids = extract_gallery_features(
+        model, gallery_loader, device,
+        compute_uncertainty=include_uncertainty,
+    )
 
     num_queries = query_mu.size(0)
     num_gallery = gallery_mu.size(0)
 
-    print(f"\nComputing query-gallery distance matrix ({num_queries} x {num_gallery})...")
-
-    # Compute distance matrix between queries and gallery
-    # For each query, we compute distance to ALL gallery images
-    batch_size = 100
-    distance_matrix = torch.zeros(num_queries, num_gallery)
-
-    for i in tqdm(range(0, num_queries, batch_size)):
-        end_i = min(i + batch_size, num_queries)
-        batch_query_mu = query_mu[i:end_i].to(device)
-        batch_query_sigma = query_sigma[i:end_i].to(device)
-
-        # Compute distances to all gallery images at once
-        # Gallery features: [num_gallery, 32, 768]
-        batch_gallery_mu = gallery_mu.to(device)
-        batch_gallery_sigma = gallery_sigma.to(device)
-
-        for qi in range(batch_query_mu.size(0)):
-            # Compute distance from query[i] to all gallery images
-            for gi in range(num_gallery):
-                dist = uncertainty_aware_distance(
-                    batch_query_mu[qi:qi+1],
-                    batch_query_sigma[qi:qi+1],
-                    batch_gallery_mu[gi:gi+1],
-                    batch_gallery_sigma[gi:gi+1],
-                    aggregate=True
-                )
-                distance_matrix[i + qi, gi] = dist.item()
+    distance_matrix = compute_pairwise_distance_matrix(
+        query_mu, query_sigma, gallery_mu, gallery_sigma, device,
+        uncertainty_is_variance=getattr(model, 'uncertainty_is_variance', False),
+        include_uncertainty=include_uncertainty,
+    )
 
     # Efficiently exclude candidate images from rankings
     # For each query, set distance to its own candidate image to infinity
@@ -547,7 +542,7 @@ def main():
 
         # Evaluate
         print("Starting retrieval evaluation...")
-        metrics = evaluate_retrieval(model, query_loader, gallery_loader, gallery_id_to_idx, device)
+        metrics = evaluate_retrieval(model, query_loader, gallery_loader, gallery_id_to_idx, device, args.distance_mode)
     else:
         # Direct triplet matching (for train split or other datasets)
         print("Creating dataloader...")

@@ -5,7 +5,7 @@ python train.py \
     --data_root /mnt/data/users/quynhptit/huyptit/AAAI26-HUG/data/fashion-iq \
     --category dress \
     --batch_size 32 \
-    --num_epochs 30 \
+    --num_epochs 10 \
     --lr 3e-5 \
     --lambda_fc 0.5 \
     --lambda_cord 0.1 \
@@ -19,6 +19,8 @@ python eval.py \
     --checkpoint ./checkpoints/fashion_iq/checkpoint_final.pth \
     --batch_size 64 \
     --output_file ./results/fashion_iq_dress_results.json
+
+
 
 
 Evaluation Results:
