@@ -434,7 +434,9 @@ if lavis_path not in sys.path:
     sys.path.insert(0, lavis_path)
 
 import argparse
+import random
 import yaml
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -450,6 +452,10 @@ except ImportError:
 
 from models import HUGModel
 from modules import HUGLoss
+from modules.robustness_training import (
+    apply_modality_dropout, calibration_pair, clean_teacher_kl,
+    monotonic_ranking_loss, uncertainty_scalar,
+)
 from data import FashionIQDataset, CIRRDataset, collate_fn, get_transform
 
 # Import LAVIS processor (instead of HuggingFace Blip2Processor)
@@ -503,8 +509,36 @@ def parse_args():
                        help='LR multiplier for learnable loss scalars')
     parser.add_argument('--init_checkpoint', type=str, default=None,
                        help='Initialize model weights only (for point -> paper stage 2)')
+    parser.add_argument('--resume_checkpoint', type=str, default=None,
+                       help='Resume a complete training state from checkpoint_last.pth')
     parser.add_argument('--freeze_backbone', action='store_true',
                        help='Freeze the pretrained BLIP/Q-Former mean encoder')
+
+    # RC-HUG U1/U2/U3: disabled by default, so baseline recipes stay unchanged.
+    parser.add_argument('--lambda_monotonic', type=float, default=0.0,
+                       help='U1 weight for paired severity-monotonic uncertainty calibration')
+    parser.add_argument('--monotonic_margin', type=float, default=0.005,
+                       help='Required uncertainty increase from low to high severity')
+    parser.add_argument('--monotonic_low_severity', type=float, default=0.10,
+                       help='U1 low image-blur/text-dropout severity')
+    parser.add_argument('--monotonic_high_severity', type=float, default=0.30,
+                       help='U1 high image-blur/text-dropout severity')
+    parser.add_argument('--monotonic_modality', choices=['alternate', 'image', 'text'], default='alternate',
+                       help='Modality calibrated by U1 on each minibatch')
+    parser.add_argument('--monotonic_query_weight', type=float, default=1.0,
+                       help='Relative U1 weight on fused query uncertainty')
+    parser.add_argument('--modality_dropout_prob', type=float, default=0.0,
+                       help='U2 probability of dropping image or text information per training sample')
+    parser.add_argument('--modality_dropout_text_rate', type=float, default=0.30,
+                       help='U2 token-drop rate after text modality is selected')
+    parser.add_argument('--lambda_kd', type=float, default=0.0,
+                       help='U3 clean Point-teacher KL consistency weight')
+    parser.add_argument('--teacher_checkpoint', type=str, default=None,
+                       help='Frozen Point checkpoint required when --lambda_kd is positive')
+    parser.add_argument('--teacher_device', choices=['cpu', 'cuda'], default='cpu',
+                       help='U3 teacher device; CPU avoids a second BLIP/Q-Former consuming GPU VRAM')
+    parser.add_argument('--kd_temperature', type=float, default=0.07,
+                       help='Temperature for U3 in-batch retrieval-distribution KL')
 
     # Other arguments
     parser.add_argument('--num_workers', type=int, default=4,
@@ -514,13 +548,15 @@ def parse_args():
     parser.add_argument('--log_interval', type=int, default=10,
                        help='Log every N steps')
     parser.add_argument('--save_interval', type=int, default=1,
-                       help='Save checkpoint every N epochs')
+                       help='Archive every N epochs; 0 disables numbered archives')
     parser.add_argument('--eval_every', type=int, default=1,
                        help='Run validation every N epochs; 0 disables validation')
     parser.add_argument('--use_wandb', action='store_true',
                        help='Use Weights & Biases for logging')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
+    parser.add_argument('--tqdm_mininterval', type=float, default=1.0,
+                       help='Minimum seconds between progress-bar refreshes')
 
     return parser.parse_args()
 
@@ -529,8 +565,6 @@ def set_seed(seed: int):
     """Set random seed for reproducibility"""
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    import numpy as np
-    import random
     np.random.seed(seed)
     random.seed(seed)
 
@@ -590,117 +624,190 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     epoch: int,
-    args
+    args,
+    teacher=None,
+    teacher_device=None,
 ):
-    """Train for one epoch"""
+    """Train one epoch, optionally adding RC-HUG U1/U2/U3 objectives."""
     model.train()
     if args.freeze_backbone:
-        # Keep dropout disabled in the frozen mean encoder while uncertainty
-        # heads remain in training mode.
+        # Keep dropout disabled in frozen mean encoder while uncertainty heads train.
         model.blip_backbone.eval()
 
-    total_loss = 0
-    total_loss_hc = 0
-    total_loss_fc = 0
-    total_loss_cord = 0
-
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
+    totals = {key: 0.0 for key in ('loss', 'loss_hc', 'loss_fc', 'loss_cord', 'loss_mono', 'loss_kd', 'drop_image', 'drop_text')}
+    pbar = tqdm(dataloader, desc=f'Epoch {epoch}', mininterval=args.tqdm_mininterval)
 
     for step, batch in enumerate(pbar):
-        # Move batch to device
-        ref_images = batch['ref_images'].to(device)
+        clean_ref_images = batch['ref_images'].to(device)
         target_images = batch['target_images'].to(device)
-        text_input_ids = batch['text_input_ids'].to(device)
-        text_attention_mask = batch['text_attention_mask'].to(device)
+        clean_text_ids = batch['text_input_ids'].to(device)
+        clean_text_mask = batch['text_attention_mask'].to(device)
 
-        # Forward pass
+        # U2: corruption is applied in-memory only; source data remain untouched.
+        ref_images, text_input_ids, text_attention_mask, dropout_stats = apply_modality_dropout(
+            clean_ref_images, clean_text_ids, clean_text_mask,
+            args.modality_dropout_prob, args.modality_dropout_text_rate,
+        )
         outputs = model(
             ref_pixel_values=ref_images,
             text_input_ids=text_input_ids,
             text_attention_mask=text_attention_mask,
             target_pixel_values=target_images,
-            compute_uncertainty=args.recipe != 'point'
+            compute_uncertainty=args.recipe != 'point',
         )
 
         sigma_m_mismatched = None
         if criterion.needs_mismatched:
-            # A random cyclic shift is a derangement: it never creates false matches.
+            # A cyclic shift is a derangement, so no matched pair is reused.
             batch_size = text_input_ids.size(0)
             shift = torch.randint(1, batch_size, (), device=text_input_ids.device)
             shuffled_indices = torch.arange(batch_size, device=text_input_ids.device).roll(shift.item())
             sigma_m_mismatched = model.extract_coordination_uncertainty(
                 ref_pixel_values=ref_images,
                 text_input_ids=text_input_ids[shuffled_indices],
-                text_attention_mask=text_attention_mask[shuffled_indices]
+                text_attention_mask=text_attention_mask[shuffled_indices],
             )
 
-        # Compute loss
         loss_dict = criterion(
-            mu_q=outputs['mu_q'],
-            sigma_q=outputs['sigma_q'],
-            mu_c=outputs['mu_c'],
-            sigma_c=outputs['sigma_c'],
-            sigma_m_matched=outputs['sigma_m'],
-            sigma_m_mismatched=sigma_m_mismatched
+            mu_q=outputs['mu_q'], sigma_q=outputs['sigma_q'],
+            mu_c=outputs['mu_c'], sigma_c=outputs['sigma_c'],
+            sigma_m_matched=outputs['sigma_m'], sigma_m_mismatched=sigma_m_mismatched,
         )
-
         loss = loss_dict['total_loss']
+        loss_mono = loss.detach().new_zeros(())
+        loss_kd = loss.detach().new_zeros(())
 
-        # Backward pass
+        if args.lambda_monotonic > 0:
+            modality = args.monotonic_modality
+            if modality == 'alternate':
+                modality = 'image' if ((epoch - 1) * len(dataloader) + step) % 2 == 0 else 'text'
+            low_view, high_view = calibration_pair(
+                clean_ref_images, clean_text_ids, clean_text_mask, modality,
+                args.monotonic_low_severity, args.monotonic_high_severity,
+            )
+            low_parts = model.extract_query_components(*low_view)
+            high_parts = model.extract_query_components(*high_view)
+            component_key = 'sigma_r' if modality == 'image' else 'sigma_t'
+            low_component = uncertainty_scalar(low_parts[component_key], model.uncertainty_is_variance)
+            high_component = uncertainty_scalar(high_parts[component_key], model.uncertainty_is_variance)
+            low_query = uncertainty_scalar(low_parts['sigma_q'], model.uncertainty_is_variance)
+            high_query = uncertainty_scalar(high_parts['sigma_q'], model.uncertainty_is_variance)
+            loss_mono = monotonic_ranking_loss(low_component, high_component, args.monotonic_margin)
+            loss_mono = loss_mono + args.monotonic_query_weight * monotonic_ranking_loss(
+                low_query, high_query, args.monotonic_margin
+            )
+            loss = loss + args.lambda_monotonic * loss_mono
+
+        if teacher is not None:
+            # U3: clean Point teacher, corrupted/current student; gallery targets stay clean.
+            with torch.no_grad():
+                teacher_outputs = teacher(
+                    clean_ref_images.to(teacher_device),
+                    clean_text_ids.to(teacher_device),
+                    clean_text_mask.to(teacher_device),
+                    target_images.to(teacher_device),
+                    compute_uncertainty=False,
+                )
+            loss_kd = clean_teacher_kl(
+                outputs['mu_q'], outputs['mu_c'],
+                teacher_outputs['mu_q'].to(device), teacher_outputs['mu_c'].to(device), args.kd_temperature,
+            )
+            loss = loss + args.lambda_kd * loss_kd
+
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(model.parameters()) + list(criterion.parameters()), max_norm=1.0
-        )
+        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(criterion.parameters()), max_norm=1.0)
         optimizer.step()
 
-        # Update statistics
-        total_loss += loss.item()
-        total_loss_hc += loss_dict['loss_hc'].item()
-        total_loss_fc += loss_dict['loss_fc'].item()
-        total_loss_cord += loss_dict['loss_cord'].item()
+        values = {
+            'loss': loss.item(), 'loss_hc': loss_dict['loss_hc'].item(),
+            'loss_fc': loss_dict['loss_fc'].item(), 'loss_cord': loss_dict['loss_cord'].item(),
+            'loss_mono': loss_mono.item(), 'loss_kd': loss_kd.item(),
+            'drop_image': dropout_stats['image_fraction'], 'drop_text': dropout_stats['text_fraction'],
+        }
+        for key, value in values.items():
+            totals[key] += value
+        pbar.set_postfix(loss=f"{values['loss']:.4f}", mono=f"{values['loss_mono']:.4f}", kd=f"{values['loss_kd']:.4f}")
 
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': loss.item(),
-            'loss_hc': loss_dict['loss_hc'].item(),
-            'loss_fc': loss_dict['loss_fc'].item(),
-            'loss_cord': loss_dict['loss_cord'].item()
-        })
-
-        # Log to wandb
         if args.use_wandb and step % args.log_interval == 0:
             wandb.log({
-                'train/loss': loss.item(),
-                'train/loss_hc': loss_dict['loss_hc'].item(),
-                'train/loss_fc': loss_dict['loss_fc'].item(),
-                'train/loss_cord': loss_dict['loss_cord'].item(),
+                'train/loss': values['loss'], 'train/loss_hc': values['loss_hc'],
+                'train/loss_fc': values['loss_fc'], 'train/loss_cord': values['loss_cord'],
+                'train/loss_mono': values['loss_mono'], 'train/loss_kd': values['loss_kd'],
+                'train/drop_image_fraction': values['drop_image'], 'train/drop_text_fraction': values['drop_text'],
                 'train/step': epoch * len(dataloader) + step,
-                'train/lr_head': optimizer.param_groups[1]['lr'],
-                'train/lr_backbone': optimizer.param_groups[0]['lr']
+                'train/lr_head': optimizer.param_groups[1]['lr'], 'train/lr_backbone': optimizer.param_groups[0]['lr'],
             })
 
-    # Return average losses
     num_batches = len(dataloader)
-    return {
-        'loss': total_loss / num_batches,
-        'loss_hc': total_loss_hc / num_batches,
-        'loss_fc': total_loss_fc / num_batches,
-        'loss_cord': total_loss_cord / num_batches
+    return {key: value / num_batches for key, value in totals.items()}
+
+
+def build_point_teacher(args, device: torch.device):
+    """Load a frozen Point model for U3 without adding it to the optimizer."""
+    if not args.teacher_checkpoint or not os.path.isfile(args.teacher_checkpoint):
+        raise ValueError('--lambda_kd requires an existing --teacher_checkpoint')
+    if args.teacher_device == 'cuda' and not torch.cuda.is_available():
+        raise ValueError('--teacher_device cuda requested but CUDA is unavailable')
+    teacher_device = torch.device(args.teacher_device)
+    teacher = HUGModel(
+        num_queries=args.num_queries, hidden_dim=args.hidden_dim,
+        blip_model_name=args.blip_model, freeze_vision_encoder=True,
+        text_feature_mode='query_tokens', uncertainty_is_variance=True,
+        backbone_device=str(teacher_device),
+    ).to(teacher_device)
+    checkpoint = torch.load(args.teacher_checkpoint, map_location=teacher_device)
+    teacher.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    teacher.eval()
+    for parameter in teacher.parameters():
+        parameter.requires_grad = False
+    print(f'Loaded frozen Point teacher from {args.teacher_checkpoint} on {teacher_device}')
+    return teacher, teacher_device
+
+
+def _rng_state():
+    state = {
+        'torch': torch.get_rng_state(),
+        'numpy': np.random.get_state(),
+        'python': random.getstate(),
     }
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    return state
 
 
-def save_checkpoint(model, optimizer, epoch, args, filename='checkpoint.pth'):
-    """Save model checkpoint"""
+def _restore_rng_state(state):
+    torch.set_rng_state(state['torch'].cpu())
+    np.random.set_state(state['numpy'])
+    random.setstate(state['python'])
+    if torch.cuda.is_available() and 'cuda' in state:
+        torch.cuda.set_rng_state_all([value.cpu() for value in state['cuda']])
+
+
+def save_checkpoint(model, optimizer, criterion, scheduler, epoch, args,
+                    filename='checkpoint.pth', best_score=float('-inf'),
+                    include_training_state=True):
+    """Save a model-only evaluation checkpoint or resumable training state."""
     os.makedirs(args.output_dir, exist_ok=True)
     checkpoint_path = os.path.join(args.output_dir, filename)
 
-    torch.save({
+    checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'args': vars(args)
-    }, checkpoint_path)
+        'args': vars(args),
+        'best_score': best_score,
+    }
+    if include_training_state:
+        checkpoint.update({
+            'optimizer_state_dict': optimizer.state_dict(),
+            'criterion_state_dict': criterion.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'rng_state': _rng_state(),
+            'resumable': True,
+        })
+    temporary_path = checkpoint_path + '.tmp'
+    torch.save(checkpoint, temporary_path)
+    os.replace(temporary_path, checkpoint_path)
 
     print(f"Checkpoint saved to {checkpoint_path}")
 
@@ -708,7 +815,18 @@ def save_checkpoint(model, optimizer, epoch, args, filename='checkpoint.pth'):
 def main():
     """Main training function"""
     args = parse_args()
+    if args.init_checkpoint and args.resume_checkpoint:
+        raise ValueError('--init_checkpoint and --resume_checkpoint are mutually exclusive')
+    if args.save_interval < 0:
+        raise ValueError('--save_interval must be >= 0')
     set_seed(args.seed)
+    robust_enabled = args.lambda_monotonic > 0 or args.modality_dropout_prob > 0 or args.lambda_kd > 0
+    if robust_enabled and args.recipe != 'paper':
+        raise ValueError('U1/U2/U3 require --recipe paper; legacy and point baselines stay unchanged.')
+    if args.lambda_monotonic > 0 and not (0 <= args.monotonic_low_severity < args.monotonic_high_severity <= 1):
+        raise ValueError('Require 0 <= --monotonic_low_severity < --monotonic_high_severity <= 1')
+    if args.lambda_kd > 0 and args.freeze_backbone:
+        raise ValueError('U3 KD needs a trainable mean encoder; remove --freeze_backbone.')
 
     # Initialize wandb
     if args.use_wandb and not HAS_WANDB:
@@ -752,6 +870,15 @@ def main():
             param.requires_grad = False
         model.query_tokens.requires_grad = False
         print("Frozen BLIP/Q-Former backbone and query tokens")
+
+    teacher, teacher_device = build_point_teacher(args, device) if args.lambda_kd > 0 else (None, None)
+    if robust_enabled:
+        print(
+            'RC-HUG objectives: '
+            f'U1(lambda={args.lambda_monotonic:g}), '
+            f'U2(prob={args.modality_dropout_prob:g}), '
+            f'U3(lambda={args.lambda_kd:g})'
+        )
 
     # Create loss function
     criterion = HUGLoss(
@@ -816,11 +943,49 @@ def main():
 
     # Training loop
     best_score = float("-inf")
+    start_epoch = 1
+    if args.resume_checkpoint:
+        if not os.path.isfile(args.resume_checkpoint):
+            raise ValueError(f'Resume checkpoint not found: {args.resume_checkpoint}')
+        resume = torch.load(args.resume_checkpoint, map_location=device)
+        required = {
+            'model_state_dict', 'optimizer_state_dict', 'criterion_state_dict',
+            'scheduler_state_dict', 'rng_state', 'epoch', 'resumable',
+        }
+        missing = sorted(required.difference(resume))
+        if missing:
+            raise ValueError(
+                f'Checkpoint is not safely resumable ({", ".join(missing)} missing): '
+                f'{args.resume_checkpoint}'
+            )
+        previous_args = resume.get('args', {})
+        for name in ('dataset', 'category', 'batch_size', 'num_epochs', 'lr',
+                     'weight_decay', 'warmup_epochs', 'num_queries', 'hidden_dim',
+                     'blip_model', 'recipe', 'lambda_fc', 'lambda_cord',
+                     'loss_lr_multiplier', 'freeze_backbone', 'seed'):
+            if name in previous_args and previous_args[name] != getattr(args, name):
+                raise ValueError(
+                    f'Resume argument mismatch for {name}: '
+                    f'{previous_args[name]!r} != {getattr(args, name)!r}'
+                )
+        model.load_state_dict(resume['model_state_dict'], strict=True)
+        criterion.load_state_dict(resume['criterion_state_dict'], strict=True)
+        optimizer.load_state_dict(resume['optimizer_state_dict'])
+        scheduler.load_state_dict(resume['scheduler_state_dict'])
+        _restore_rng_state(resume['rng_state'])
+        start_epoch = int(resume['epoch']) + 1
+        best_score = float(resume.get('best_score', float('-inf')))
+        print(f'Resumed training from {args.resume_checkpoint} at epoch {start_epoch}')
+        if start_epoch > args.num_epochs:
+            raise ValueError(
+                f'Resume checkpoint already reached epoch {resume["epoch"]}; '
+                f'num_epochs={args.num_epochs}'
+            )
     print("Starting training...")
-    for epoch in range(1, args.num_epochs + 1):
+    for epoch in range(start_epoch, args.num_epochs + 1):
         # Train one epoch
         train_metrics = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, args
+            model, train_loader, criterion, optimizer, device, epoch, args, teacher, teacher_device
         )
 
         # Print epoch summary
@@ -829,6 +994,8 @@ def main():
         print(f"  Loss HC: {train_metrics['loss_hc']:.4f}")
         print(f"  Loss FC: {train_metrics['loss_fc']:.4f}")
         print(f"  Loss Cord: {train_metrics['loss_cord']:.4f}")
+        print(f"  Loss Mono: {train_metrics['loss_mono']:.4f}")
+        print(f"  Loss KD: {train_metrics['loss_kd']:.4f}")
 
         # Log epoch metrics
         if args.use_wandb:
@@ -837,6 +1004,8 @@ def main():
                 'train/epoch_loss_hc': train_metrics['loss_hc'],
                 'train/epoch_loss_fc': train_metrics['loss_fc'],
                 'train/epoch_loss_cord': train_metrics['loss_cord'],
+                'train/epoch_loss_mono': train_metrics['loss_mono'],
+                'train/epoch_loss_kd': train_metrics['loss_kd'],
                 'train/epoch': epoch
             })
 
@@ -860,19 +1029,32 @@ def main():
                 })
             if val_score > best_score:
                 best_score = val_score
-                save_checkpoint(model, optimizer, epoch, args, 'checkpoint_best.pth')
+                save_checkpoint(
+                    model, optimizer, criterion, scheduler, epoch, args,
+                    'checkpoint_best.pth', best_score, include_training_state=False,
+                )
                 print(f"  New best validation checkpoint (Avg={best_score:.2f})")
             model.train()
 
         # Update learning rate
         scheduler.step()
 
-        # Save checkpoint
-        if epoch % args.save_interval == 0:
-            save_checkpoint(model, optimizer, epoch, args, f'checkpoint_epoch_{epoch}.pth')
+        # Keep one resumable checkpoint instead of one multi-GB file per epoch.
+        save_checkpoint(
+            model, optimizer, criterion, scheduler, epoch, args,
+            'checkpoint_last.pth', best_score, include_training_state=True,
+        )
+        if args.save_interval > 0 and epoch % args.save_interval == 0:
+            save_checkpoint(
+                model, optimizer, criterion, scheduler, epoch, args,
+                f'checkpoint_epoch_{epoch}.pth', best_score, include_training_state=True,
+            )
 
     # Save final checkpoint
-    save_checkpoint(model, optimizer, args.num_epochs, args, 'checkpoint_final.pth')
+    save_checkpoint(
+        model, optimizer, criterion, scheduler, args.num_epochs, args,
+        'checkpoint_final.pth', best_score, include_training_state=False,
+    )
 
     print("Training completed!")
 

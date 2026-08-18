@@ -214,3 +214,4 @@ wandb/
 ref/
 /.env
 /zip_tool.py
+/word&md&pdf/*

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+DATASET=${DATASET:-fashion-iq}
+DATA_ROOT=${DATA_ROOT:-$ROOT_DIR/data/fashion-iq}
+CATEGORY=${CATEGORY:-dress}
+RESULT_ROOT=${RESULT_ROOT:-$ROOT_DIR/results/person2}
+BATCH_SIZE=${BATCH_SIZE:-32}
+NUM_WORKERS=${NUM_WORKERS:-4}
+SEED=${SEED:-42}
+VENV=${VENV:-$ROOT_DIR/ref/LAVIS/.venv/bin/activate}
+[[ -f "$VENV" ]] && source "$VENV"
+cd "$ROOT_DIR"
+
+run_sweep() {
+  local model_id=$1 checkpoint=$2 skip=${3:-false}
+  [[ -f "$checkpoint" ]] || { echo "Missing checkpoint: $checkpoint" >&2; return 1; }
+  local extra=()
+  [[ "$skip" == true ]] && extra+=(--skip_uncertainty)
+  [[ "$skip" == false ]] && extra+=(--include_mismatch)
+  python -u eval/robustness.py sweep --dataset fashion-iq --data_root "$DATA_ROOT" --split val --category dress \
+    --checkpoint "$checkpoint" --model_id "$model_id" --batch_size "$BATCH_SIZE" --num_workers "$NUM_WORKERS" \
+    --seed "$SEED" --distance_modes mean $([[ "$skip" == false ]] && echo probabilistic) \
+    --output_dir "$RESULT_ROOT/week3/$model_id" "${extra[@]}"
+}
+
+case "${1:-help}" in
+  week1)
+    python -m py_compile eval/robustness.py
+    for severity in 0 1 2 3 4; do
+      python eval/robustness.py generate --data_root "$DATA_ROOT" --group A --modality image --corruption gaussian_blur --severity "$severity" --seed "$SEED" --output_file "$RESULT_ROOT/week1/A_image_blur_s${severity}.json"
+      python eval/robustness.py generate --data_root "$DATA_ROOT" --group A --modality text --corruption typo --severity "$severity" --seed "$SEED" --output_file "$RESULT_ROOT/week1/A_text_typo_s${severity}.json"
+      python eval/robustness.py generate --data_root "$DATA_ROOT" --group B --modality image --corruption occlusion --severity "$severity" --seed "$SEED" --output_file "$RESULT_ROOT/week1/B_image_occlusion_s${severity}.json"
+      python eval/robustness.py generate --data_root "$DATA_ROOT" --group B --modality text --corruption token_dropout --severity "$severity" --seed "$SEED" --output_file "$RESULT_ROOT/week1/B_text_dropout_s${severity}.json"
+    done
+    ;;
+  week2)
+    run_sweep paper_dress "${PAPER_CHECKPOINT:-$ROOT_DIR/checkpoints/paper_dress_seed42/checkpoint_best.pth}" false week2
+    python eval/robustness.py aggregate --input_glob "$RESULT_ROOT/week2/**/*.json" --output_file "$RESULT_ROOT/week2_summary.json"
+    ;;
+  week3)
+    run_sweep point_dress "${POINT_CHECKPOINT:-$ROOT_DIR/checkpoints/point_dress_seed42/checkpoint_best.pth}" true week3
+    run_sweep legacy_dress "${LEGACY_CHECKPOINT:-$ROOT_DIR/checkpoints/legacy_dress_seed42/checkpoint_final.pth}" false week3
+    run_sweep paper_dress "${PAPER_CHECKPOINT:-$ROOT_DIR/checkpoints/paper_dress_seed42/checkpoint_best.pth}" false week3
+    python eval/robustness.py aggregate --input_glob "$RESULT_ROOT/week3/**/*.json" --output_file "$RESULT_ROOT/week3_summary.json"
+    ;;
+  week4-5|week6)
+    echo "STOP: train.py chưa có monotonic calibration, modality dropout hoặc KD flags. Không chạy lệnh U1/U2/U3 giả." >&2
+    echo "Cần implement + unit-test các loss trước, sau đó dùng subcommand custom bên dưới để eval checkpoint mới." >&2
+    exit 2
+    ;;
+  week7-8)
+    echo "Dùng: $0 custom MODEL_ID CHECKPOINT DATASET CATEGORY DATA_ROOT [point]"; exit 2
+    ;;
+  week9-10)
+    python eval/robustness.py aggregate --input_glob "$RESULT_ROOT/**/*.json" --output_file "$RESULT_ROOT/final_summary.json"
+    ;;
+  custom)
+    model_id=${2:?MODEL_ID}; checkpoint=${3:?CHECKPOINT}; DATASET=${4:?DATASET}; CATEGORY=${5:?CATEGORY}; DATA_ROOT=${6:?DATA_ROOT}; point=${7:-hug}
+    skip=false; [[ "$point" == point ]] && skip=true
+    run_sweep "$model_id" "$checkpoint" "$skip" week7-8
+    ;;
+  *)
+    echo "Usage: $0 {week1|week2|week3|week4-5|week6|week7-8|week9-10|custom}"; exit 2
+    ;;
+esac

@@ -48,7 +48,8 @@ class HUGModel(nn.Module):
         uncertainty_num_heads: int = 4,
         uncertainty_dropout: float = 0.1,
         text_feature_mode: str = "query_tokens",
-        uncertainty_is_variance: bool = True
+        uncertainty_is_variance: bool = True,
+        backbone_device: str | None = None,
     ):
         super().__init__()
 
@@ -56,11 +57,12 @@ class HUGModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.text_feature_mode = text_feature_mode
         self.uncertainty_is_variance = uncertainty_is_variance
+        self.backbone_device = backbone_device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         # BLIP-2 Q-Former backbone
         self.blip_backbone = BLIPBackbone(
             model_type=blip_model_name,  # LAVIS model type
-            device="cuda" if torch.cuda.is_available() else "cpu",
+            device=self.backbone_device,
             freeze_vision_encoder=freeze_vision_encoder,
             freeze_qformer=False  # Q-Former should be trainable
         )
