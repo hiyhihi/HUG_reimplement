@@ -504,12 +504,8 @@ def parse_args():
                        help='Weight for fine-grained contrastive loss')
     parser.add_argument('--lambda_cord', type=float, default=0.1,
                        help='Weight for coordination loss')
-    parser.add_argument(
-        '--recipe',
-        choices=['legacy', 'point', 'point_continued', 'point_robust', 'paper'],
-        default='paper',
-        help='Training objective and representation recipe',
-    )
+    parser.add_argument('--recipe', choices=['legacy', 'point', 'point_robust', 'paper'], default='paper',
+                       help='Training objective and representation recipe')
     parser.add_argument('--loss_lr_multiplier', type=float, default=100.0,
                        help='LR multiplier for learnable loss scalars')
     parser.add_argument('--hc_mean_distance', action='store_true',
@@ -517,7 +513,7 @@ def parse_args():
     parser.add_argument('--hc_average_negatives', action='store_true',
                        help='Diagnostic ablation: HC averages negatives instead of summing them per query')
     parser.add_argument('--init_checkpoint', type=str, default=None,
-                       help='Initialize model weights only, without optimizer/scheduler state')
+                       help='Initialize model weights only (for point -> paper stage 2)')
     parser.add_argument('--resume_checkpoint', type=str, default=None,
                        help='Resume a complete training state from checkpoint_last.pth')
     parser.add_argument('--freeze_backbone', action='store_true',
@@ -719,7 +715,7 @@ def train_one_epoch(
         clean_text_ids = batch['text_input_ids'].to(device)
         clean_text_mask = batch['text_attention_mask'].to(device)
 
-        if args.recipe in {'point_continued', 'point_robust'}:
+        if args.recipe == 'point_robust':
             ref_images, text_input_ids, text_attention_mask = (
                 clean_ref_images, clean_text_ids, clean_text_mask
             )
@@ -735,7 +731,7 @@ def train_one_epoch(
             text_input_ids=text_input_ids,
             text_attention_mask=text_attention_mask,
             target_pixel_values=target_images,
-            compute_uncertainty=args.recipe not in {'point', 'point_continued', 'point_robust'},
+            compute_uncertainty=args.recipe not in {'point', 'point_robust'},
         )
 
         sigma_m_mismatched = None
@@ -954,8 +950,6 @@ def main():
         raise ValueError('--early_stopping_min_delta must be >= 0')
     if args.early_stopping_patience > 0 and args.eval_every <= 0:
         raise ValueError('Early stopping requires --eval_every > 0')
-    if args.recipe in {'point_continued', 'point_robust'} and args.eval_every <= 0:
-        raise ValueError(f'{args.recipe} requires clean validation with --eval_every > 0')
     if args.instrumentation_every < 0:
         raise ValueError('--instrumentation_every must be >= 0')
     if (args.hc_mean_distance or args.hc_average_negatives) and args.recipe != 'paper':
@@ -964,11 +958,9 @@ def main():
         raise ValueError('--robust_text_dropout_rate must be in (0, 1)')
     if args.lambda_robust_retrieval <= 0 or args.lambda_robust_consistency < 0:
         raise ValueError('Point-robust loss weights require retrieval > 0 and consistency >= 0')
-    if args.recipe in {'point_continued', 'point_robust'} and not (
-        args.init_checkpoint or args.resume_checkpoint
-    ):
+    if args.recipe == 'point_robust' and not (args.init_checkpoint or args.resume_checkpoint):
         raise ValueError(
-            f'--recipe {args.recipe} must warm-start with --init_checkpoint or resume a prior run'
+            '--recipe point_robust must warm-start with --init_checkpoint or resume a prior run'
         )
     set_seed(args.seed)
     robust_enabled = args.lambda_monotonic > 0 or args.modality_dropout_prob > 0 or args.lambda_kd > 0
@@ -1035,19 +1027,17 @@ def main():
     criterion = HUGLoss(
         lambda_fc=args.lambda_fc,
         lambda_cord=args.lambda_cord,
-        recipe='point' if args.recipe in {'point_continued', 'point_robust'} else args.recipe,
+        recipe='point' if args.recipe == 'point_robust' else args.recipe,
         uncertainty_is_variance=args.recipe != 'legacy',
         hc_include_uncertainty=not args.hc_mean_distance,
         hc_average_negatives=args.hc_average_negatives,
     ).to(device)
-    if args.recipe in {'point', 'point_continued', 'point_robust'}:
+    if args.recipe in {'point', 'point_robust'}:
         print(
             "Loss recipe: point (symmetric mean-only InfoNCE); "
             "Loss FC and Loss Cord are intentionally disabled."
         )
-        if args.recipe == 'point_continued':
-            print('Point-continued control: clean InfoNCE only; no corrupted view or consistency loss')
-        elif args.recipe == 'point_robust':
+        if args.recipe == 'point_robust':
             print(
                 'Point-robust view: '
                 f'token_dropout={args.robust_text_dropout_rate:g}, '
@@ -1152,23 +1142,6 @@ def main():
                 f'Resume checkpoint already reached epoch {resume["epoch"]}; '
                 f'num_epochs={args.num_epochs}'
             )
-    if args.recipe in {'point_continued', 'point_robust'} and not args.resume_checkpoint:
-        query_loader, gallery_loader, gallery_id_to_idx = val_loaders
-        initial_metrics = evaluate_retrieval(
-            model, query_loader, gallery_loader, gallery_id_to_idx,
-            device, distance_mode='mean'
-        )
-        best_score = 0.5 * (initial_metrics['recall@10'] + initial_metrics['recall@50'])
-        print(
-            '  Initial Point R@10: '
-            f"{initial_metrics['recall@10']:.2f} | R@50: {initial_metrics['recall@50']:.2f} | "
-            f'Avg: {best_score:.2f}'
-        )
-        save_checkpoint(
-            model, optimizer, criterion, scheduler, 0, args,
-            'checkpoint_best.pth', best_score, include_training_state=False,
-        )
-        model.train()
     if args.log_instrumentation:
         _log_trainability(model)
     print("Starting training...")
@@ -1209,7 +1182,7 @@ def main():
             # Mean-only HC does not train uncertainty, so selecting its best
             # checkpoint with probabilistic distance would be an invalid control.
             validation_distance_mode = (
-                "mean" if args.recipe in {"point", "point_continued", "point_robust"} or args.hc_mean_distance
+                "mean" if args.recipe in {"point", "point_robust"} or args.hc_mean_distance
                 else "probabilistic"
             )
             val_metrics = evaluate_retrieval(

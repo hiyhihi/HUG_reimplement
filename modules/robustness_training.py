@@ -79,6 +79,19 @@ def text_dropout_pair(
     return low, high
 
 
+def text_dropout_view(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    probability: float,
+    pad_token_id: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Create one token-dropout view while preserving boundary special tokens."""
+    noise = torch.rand(input_ids.shape, device=input_ids.device)
+    return _apply_text_dropout_from_noise(
+        input_ids, attention_mask, probability, noise, pad_token_id
+    )
+
+
 def blur_images(images: torch.Tensor, severity: float) -> torch.Tensor:
     """Deterministic, differentiable box-blur used only for U1 calibration views."""
     if not 0.0 <= severity <= 1.0:

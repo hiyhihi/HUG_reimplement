@@ -256,29 +256,43 @@ class HolisticContrastiveLoss(nn.Module):
     """Sigmoid holistic contrast with legacy and paper-compatible variants."""
     def __init__(
         self, init_a=2.0, init_b=-5.0, symmetric=False,
-        uncertainty_is_variance=False,
+        uncertainty_is_variance=False, include_uncertainty=True,
+        average_negatives=False,
     ):
         super().__init__()
         self.a = nn.Parameter(torch.tensor(init_a, dtype=torch.float32))
         self.b = nn.Parameter(torch.tensor(init_b, dtype=torch.float32))
         self.symmetric = symmetric
         self.uncertainty_is_variance = uncertainty_is_variance
+        self.include_uncertainty = include_uncertainty
+        self.average_negatives = average_negatives
 
-    def forward(self, mu_q, sigma_q, mu_c, sigma_c):
-        distances = pairwise_uncertainty_distance(
+    def pairwise_distances(self, mu_q, sigma_q, mu_c, sigma_c):
+        return pairwise_uncertainty_distance(
             mu_q, sigma_q, mu_c, sigma_c,
             uncertainty_is_variance=self.uncertainty_is_variance,
+            include_uncertainty=self.include_uncertainty,
         )
+
+    def forward(self, mu_q, sigma_q, mu_c, sigma_c):
+        distances = self.pairwise_distances(mu_q, sigma_q, mu_c, sigma_c)
         batch_size = distances.size(0)
         if batch_size < 2:
             raise ValueError("Holistic contrast requires batch_size >= 2")
         positive_loss = F.softplus(self.a * distances.diagonal() + self.b).mean()
         mask = ~torch.eye(batch_size, dtype=torch.bool, device=distances.device)
         negative_loss = F.softplus(-self.a * distances - self.b).masked_fill(~mask, 0)
-        row_loss = negative_loss.sum(dim=1).mean()
+        if self.average_negatives:
+            row_loss = negative_loss[mask].mean()
+        else:
+            row_loss = negative_loss.sum(dim=1).mean()
         if not self.symmetric:
             return positive_loss + row_loss
-        return positive_loss + row_loss + negative_loss.sum(dim=0).mean()
+        if self.average_negatives:
+            column_loss = negative_loss[mask].mean()
+        else:
+            column_loss = negative_loss.sum(dim=0).mean()
+        return positive_loss + row_loss + column_loss
 
 
 class PointContrastiveLoss(nn.Module):
@@ -361,6 +375,7 @@ class HUGLoss(nn.Module):
     def __init__(
         self, lambda_fc=0.5, lambda_cord=0.1, margin_cord=0.2,
         temperature_fc=0.07, recipe="paper", uncertainty_is_variance=True,
+        hc_include_uncertainty=True, hc_average_negatives=False,
     ):
         super().__init__()
         if recipe not in {"legacy", "point", "paper"}:
@@ -376,9 +391,34 @@ class HUGLoss(nn.Module):
             self.loss_fc = LegacyFineGrainedContrastiveLoss(temperature_fc)
             self.loss_cord = MultiModalCoordinationLoss(margin_cord, False, False)
         else:
-            self.loss_hc = HolisticContrastiveLoss(1.0, 0.0, True, uncertainty_is_variance)
+            self.loss_hc = HolisticContrastiveLoss(
+                1.0, 0.0, True, uncertainty_is_variance,
+                include_uncertainty=hc_include_uncertainty,
+                average_negatives=hc_average_negatives,
+            )
             self.loss_fc = PaperFineGrainedContrastiveLoss()
             self.loss_cord = MultiModalCoordinationLoss(0.0, uncertainty_is_variance, True)
+
+    @torch.no_grad()
+    def hc_diagnostics(self, mu_q, sigma_q, mu_c, sigma_c):
+        """Return compact HC distance and variance values for a training log."""
+        if self.recipe == "point":
+            return {}
+        distances = self.loss_hc.pairwise_distances(mu_q, sigma_q, mu_c, sigma_c)
+        mask = ~torch.eye(distances.size(0), dtype=torch.bool, device=distances.device)
+        positive = distances.diagonal()
+        negative = distances[mask]
+        query_variance = _as_variance(sigma_q.float(), self.loss_hc.uncertainty_is_variance)
+        candidate_variance = _as_variance(sigma_c.float(), self.loss_hc.uncertainty_is_variance)
+        return {
+            'hc_pos_distance': positive.mean().item(),
+            'hc_neg_distance': negative.mean().item(),
+            'hc_distance_margin': (negative.mean() - positive.mean()).item(),
+            'query_variance': query_variance.mean().item(),
+            'candidate_variance': candidate_variance.mean().item(),
+            'hc_a': self.loss_hc.a.item(),
+            'hc_b': self.loss_hc.b.item(),
+        }
 
     def forward(
         self, mu_q, sigma_q, mu_c, sigma_c,

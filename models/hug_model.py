@@ -14,7 +14,6 @@ from typing import Optional, Dict
 from .blip_backbone import BLIPBackbone
 from .uncertainty_head import UncertaintyEstimator
 from modules.dynamic_weighting import DynamicWeighting
-import torch.nn.functional as F
 
 
 class HUGModel(nn.Module):
@@ -67,17 +66,11 @@ class HUGModel(nn.Module):
             freeze_qformer=False  # Q-Former should be trainable
         )
 
-        # Learnable query tokens (K=32 Gaussian distributions)
-        # Shape: [1, num_queries, hidden_dim]
-        # self.query_tokens = nn.Parameter(
-        #     torch.randn(1, num_queries, hidden_dim) * 0.02
-        # )
+        # Reuse pretrained BLIP-2 query tokens and keep them trainable.
         self.query_tokens = nn.Parameter(
             self.blip_backbone.blip_model.query_tokens.clone().detach()
         )
         self.query_tokens.requires_grad = True
-        
-        # Bắt buộc đè lại vào trong Qformer để nó sử dụng lúc forward
         self.blip_backbone.blip_model.Qformer.query_tokens = self.query_tokens
 
         # Three uncertainty estimators
@@ -165,7 +158,6 @@ class HUGModel(nn.Module):
             attention_mask=text_attention_mask,
             query_embeds=query_embeds
         )
-        # mu_m = F.normalize(mu_m, dim=-1)
         sigma_m = self.multimodal_uncertainty_estimator(mu_m)
 
         # 2. Extract visual-only features for visual quality uncertainty (sigma_r)
@@ -173,7 +165,6 @@ class HUGModel(nn.Module):
             pixel_values=ref_pixel_values,
             query_embeds=query_embeds
         )
-        # feat_r = F.normalize(feat_r, dim=-1)
         sigma_r = self.visual_uncertainty_estimator(feat_r)
 
         # 3. Extract text-only features for text quality uncertainty (sigma_t)
@@ -183,7 +174,6 @@ class HUGModel(nn.Module):
             query_embeds=query_embeds,
             mode=self.text_feature_mode
         )
-        # feat_t = F.normalize(feat_t, dim=-1)
         sigma_t = self.text_uncertainty_estimator(feat_t)
 
         # 4. Dynamic weighting to get final query uncertainty (sigma_q)

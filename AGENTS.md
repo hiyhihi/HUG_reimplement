@@ -1,176 +1,132 @@
 # HUG-CIR project guide for Codex
 
-File này là context lõi cho session mới. Giữ nó ngắn, cập nhật bằng cách thay
-trạng thái cũ thay vì nối thêm nhật ký. Chi tiết thực nghiệm nằm trong runbook,
-JSON, checkpoint và log được trỏ ở dưới.
+File này là context lõi cho session mới. Giữ ngắn; thay trạng thái cũ thay vì
+nối nhật ký. Số liệu chi tiết nằm trong runbook, JSON, checkpoint và log.
 
-## 1. Mục tiêu dự án
+## 1. Mục tiêu
 
-Dự án nghiên cứu Composed Image Retrieval (CIR) dựa trên HUG/BLIP-2, trước hết
-trên Fashion-IQ (`dress`, `shirt`, `toptee`). Hai câu hỏi chính:
-
-1. Tái lập retrieval của HUG một cách trung thực, đồng thời nói rõ những chỗ
-   phải sửa/ổn định so với paper và public repo.
-2. Kiểm tra heterogeneous uncertainty có thực sự dự báo query failure, phản ánh
-   modality bị hỏng và giúp robustness hay không; chỉ xây reliability router nếu
-   uncertainty đã calibrated.
-
-Không tối ưu một con số đơn lẻ rồi gọi đó là exact reproduction. Mọi kết luận
-chính phải dựa trên multi-seed, paired comparison và protocol cố định.
+Nghiên cứu Composed Image Retrieval trên Fashion-IQ (`dress`, `shirt`,
+`toptee`). Hướng chính hiện tại là **reliability-aware CIR**: giữ Point
+deterministic làm backbone, xây Fashion-IQ-C bằng corruption chỉ trên query và
+dự đoán xác suất retrieval failure. Full HUG/uncertainty là kết quả no-go lịch
+sử; không tiếp tục tối ưu hay dùng uncertainty cũ để điều khiển fusion.
 
 ## 2. Thứ tự nguồn tin
 
-Khi tài liệu mâu thuẫn, ưu tiên theo thứ tự:
+Khi mâu thuẫn, ưu tiên code/config đang chạy và JSON/checkpoint/log thực tế,
+rồi `word&md&pdf/RELIABILITY_AWARE_CIR_EXPERIMENT_RUNBOOK.md`, rồi
+`word&md&pdf/SUPERVISOR_EXPERIMENT_RUNBOOK.md` và báo cáo lịch sử. Các
+thư mục `word&md&pdf/`, `data/`, `checkpoints/`, `results/`, `wandb/`, `ref/`
+có thể bị `.gitignore`; không suy ra không tồn tại từ `git status`.
 
-1. Code/config đang chạy, JSON/checkpoint/log thực tế.
-2. `word&md&pdf/SUPERVISOR_EXPERIMENT_RUNBOOK.md` — protocol v2 hiện hành.
-3. `word&md&pdf/REPORT_TO_SUPERVISOR.md` và
-   `word&md&pdf/WEEK2_WEEK3_FINDINGS.md` — kết quả/audit lịch sử.
-4. `word&md&pdf/RESEARCH_PROPOSAL.md`, `U1_U3_RUNBOOK.md`,
-   `PERSON2_ROBUSTNESS.md` — rationale và nhánh robustness.
-5. `word&md&pdf/TRAINING_NOTES.md` — lịch sử debug; không mặc định là protocol
-   mới nhất.
-6. `word&md&pdf/2601.11393v2 (1).pdf` — paper gốc.
-
-Thư mục `word&md&pdf/*`, `data/`, `checkpoints/`, `results/`, `wandb/` và `ref/`
-đang bị `.gitignore` bỏ qua. Không suy ra “không tồn tại” chỉ từ `git status`, và
-không giả định thay đổi tài liệu trong đó đã được Git lưu.
-
-## 3. Taxonomy model/artifact
+## 3. Taxonomy model
 
 | ID | Ý nghĩa đúng |
 |---|---|
-| `legacy` | Pipeline lịch sử, mốc khoảng 6x R@50; chỉ dùng làm reference. |
-| `point` | Mean-only symmetric InfoNCE, Q-Former trainable, physical batch 32. Baseline deterministic mạnh. |
-| `point_matched` | Cùng Point nhưng batch/lịch train giống `hug_e2e`; control chính cho giới hạn GPU. |
-| `hug_e2e` | BLIP-2 init, Q-Former/query tokens trainable, loss `HC + 0.5 FC + 0.1 Cord`; candidate gần mô tả paper nhất. |
-| `hug_frozen_point` | Warm-start từ Point rồi freeze mean encoder, chỉ học uncertainty; controlled ablation, không phải full HUG. |
+| `legacy` | Pipeline lịch sử, chỉ reference. |
+| `point` | Mean-only symmetric InfoNCE, Q-Former trainable, B32; deterministic baseline. |
+| `point_continued` | Warm-start Point; chỉ train tiếp clean InfoNCE; control cho `point_robust`. |
+| `point_robust` | Warm-start Point; clean InfoNCE + token-dropout InfoNCE + ranking consistency; recall/robustness ablation. |
+| `point_matched` | Cùng Point nhưng B8/lịch giống e2e; control công bằng. |
+| `hug_e2e` | BLIP-2 init, Q-Former/query tokens trainable, `HC + .5FC + .1Cord`; candidate full HUG. |
+| `hug_frozen_point` | Warm-start Point, freeze mean encoder, chỉ học uncertainty; controlled ablation, không phải full HUG. |
+| `point_reliability_probe` | Warm-start Point, freeze toàn bộ Point, học query-only failure-probability head; hướng chính v2. |
+| `point_reliability_joint` | Retrieval + failure joint training; chưa chạy, chỉ mở sau probe và relabel protocol. |
 
-Tên checkpoint cũ `paper_*` thường chỉ `hug_frozen_point`, không được tự động gọi
-là full-paper reproduction. Trong báo cáo dùng “corrected Point baseline”,
-“corrected/stabilized end-to-end HUG reproduction” và “Frozen-Point HUG
-controlled ablation”.
+Không dùng tên checkpoint cũ `paper_*` để gọi full-paper reproduction. Phải báo
+cả `hug_e2e - point` và `hug_e2e - point_matched`.
 
-## 4. Các bất biến khoa học
+## 4. Bất biến khoa học
 
-- Paper báo Fashion-IQ Dress `R@10=48.37`, `R@50=71.56`.
-- Artifact lịch sử đã xác nhận: Point seed42 khoảng `47.94/70.95`; Frozen-Point
-  probabilistic khoảng `48.44/70.9x`. Số gần paper không chứng minh protocol khớp.
-- Point dùng in-batch InfoNCE: batch 32 có 31 negatives, batch 4 chỉ có 3.
-  HUG HC hiện cũng phụ thuộc số negative theo batch. Gradient accumulation thông
-  thường không tạo physical negative pool tương đương batch 32.
-- Vì vậy phải báo cả `hug_e2e - point` và `hug_e2e - point_matched`. Không so
-  HUG batch nhỏ với Point batch 32 rồi quy toàn bộ chênh lệch cho kiến trúc.
-- Với Eq.15 hiện tại, uncertainty của một query là hằng số đối với mọi gallery
-  candidate nên không tự đổi ranking; thay đổi rank chủ yếu có thể đến từ gallery
-  variance. Đánh giá uncertainty phải dùng AUROC/AUPRC, rank correlation,
-  risk-coverage/AURC, severity monotonicity và mismatch, không chỉ Recall.
-- Corruption chỉ tác động query; target/gallery phải giữ sạch. Severity 0 phải là
-  identity. So sánh model phải dùng cùng manifest/seed.
-- Không chạy multi-seed/category sweep nếu Dress seed42 pilot chưa qua gate.
-- Không sửa loss/architecture chỉ để khớp con số paper mà không ghi thành ablation.
+- Paper Dress: `48.37/71.56` R@10/R@50; số gần không tự chứng minh protocol
+  khớp paper.
+- Physical batch quyết định in-batch negatives; gradient accumulation không
+  thay thế B32. Không so HUG batch nhỏ chỉ với Point B32.
+- Reliability là `P(failure@k | query)`, không phải HUG variance. Đánh giá bằng
+  AUROC, AUPRC, ECE, Brier, risk-coverage/AURC và per-condition metrics.
+- Corruption chỉ tác động query; severity 0 identity; paired manifest/seed.
+- Target/gallery luôn sạch. Semantic contradiction là semantic-changing stress
+  test và phải báo riêng nuisance corruptions.
+- Không multi-seed/category hoặc adaptive fusion nếu Dress seed42 reliability
+  pilot chưa qua gate. Không đổi loss/architecture hậu nghiệm mà không ghi ablation.
 
 ## 5. Bản đồ code
 
-- `train.py`: CLI, training loop, U1/U2/U3 flags, validation, atomic checkpoint và
-  resume model/optimizer/criterion/scheduler/RNG.
-- `models/hug_model.py`: mean/uncertainty representation và fusion.
-- `models/blip_backbone.py`: BLIP-2/Q-Former feature paths.
-- `modules/losses.py`: Point InfoNCE, HC, FC, coordination loss.
-- `modules/robustness_training.py`: monotonic calibration, modality dropout, KD.
-- `eval.py`: clean retrieval, mean/probabilistic distance.
-- `eval/robustness.py`: deterministic corruption, sweep, calibration metrics.
-- `eval/modality_reliance.py`: image/text-only và shuffled-modality conditions.
-- `eval/summarize_supervisor.py`: bảng CSV cuối và paired deltas.
-- `scripts/run_supervisor_experiments.sh`: orchestrator duy nhất của protocol v2.
-- `scripts/run_supervisor_person1.sh`: `point` + `hug_frozen_point`.
-- `scripts/run_supervisor_person2.sh`: `point_matched` + `hug_e2e`.
-- `scripts/run_calibrated_hug.sh`: nhánh U1/U2/U3 cũ; không trộn mặc định vào v2.
+- `train.py`: CLI, loop, resume/checkpoint/RNG, U1/U2/U3 flags.
+- `models/hug_model.py`, `modules/losses.py`: representation, fusion, loss.
+- `eval/robustness.py`, `eval/modality_reliance.py`: harness đánh giá.
+- `eval/summarize_supervisor.py`: bảng và paired deltas.
+- `scripts/run_supervisor_experiments.sh`: orchestrator protocol v2.
+- `scripts/run_supervisor_person1.sh`: Point + Frozen-Point.
+- `scripts/run_supervisor_person2.sh`: Point-matched + HUG e2e.
+- `scripts/run_point_robust_recall.sh`: pilot tăng recall/độ bền text từ Point.
+- `scripts/run_point_continued_control.sh`: control train tiếp Point chỉ với clean InfoNCE.
+- `modules/fiqc.py`, `eval/reliability.py`: Fashion-IQ-C manifest, failure labels,
+  robustness table và reliability evaluation.
+- `modules/reliability.py`, `models/reliability_model.py`, `train_reliability.py`:
+  query-only Reliability Head và head-only training trên frozen Point.
+- `scripts/run_reliability_cir.sh`: orchestrator schema/protocol `reliability_v2`; v1 read-only.
 
-## 6. Trạng thái hiện tại — thay phần này, không append lịch sử
+## 6. Trạng thái hiện tại — verified 2026-09-06, dirty `main@cfe7b44`
 
-Last verified: **2026-08-18**, `main@2b61530` (working tree sạch trước khi tạo
-file này).
+- GVHD đã chuyển hướng sang reliability-aware CIR theo
+  `word&md&pdf/Thucnghiem_tiep_CIR.docx`. Protocol chi tiết canonical mới:
+  `word&md&pdf/RELIABILITY_AWARE_CIR_EXPERIMENT_RUNBOOK.md`.
+- Pilot `reliability_v1` Dress seed42 đã hoàn tất đủ final/best/last: clean
+  `47.99/70.90`, AUROC `0.7205`, AUPRC `0.8037` với prevalence `0.6226`, ECE
+  `0.0737`, risk reduction tại 50% coverage `24.47%`. Numeric gate pass và
+  within-condition AUROC `0.7031`, nhưng synonym changed-rate train/val chỉ
+  `88.05/88.75%`, dưới Gate 0; giữ toàn bộ v1 read-only làm pilot, chưa mở
+  multi-seed/category hoặc adaptive fusion.
+- Code `reliability_v2` đã nâng Fashion-IQ-C schema 2, mở rộng synonym map,
+  fail-fast changed-rate, thêm nuisance/contradiction metrics, shortcut baselines,
+  within-condition audit, gate tổng hợp và risk-coverage CSV. Dress seed42 CPU
+  preflight 8/8 pass; audit thật đạt synonym changed-rate train `98.50%`, val
+  `98.76%`. **Chưa build label/train/evaluate GPU v2; chưa có gate v2.**
+- Bước tiếp theo duy nhất: chạy Dress seed42 v2 trong root mới; chỉ nếu JSON v2
+  có `adaptive_fusion_gate.passed=true` mới xác nhận Dress seeds 7/123. Adaptive
+  fusion vẫn đóng đến khi Dress multi-seed và complement analysis hoàn tất.
 
-- Protocol v2, two-person wrappers, resume/checkpoint, modality/robustness và
-  summarizer đã implement; compile, Bash syntax, CPU smoke tests và paired-delta
-  smoke test đã pass ở phiên trước.
-- Chưa có artifact trong `checkpoints/supervisor_protocol_v2/` hoặc
-  `results/supervisor_protocol_v2/`: bước tiếp theo là pilot Dress seed42.
-- Blocker nhỏ trước pilot: preflight trong `scripts/run_supervisor_experiments.sh`
-  vẫn kiểm tra PDF ở root, nhưng PDF đã chuyển vào `word&md&pdf/`. Sửa đường dẫn
-  hoặc xác nhận preflight trước khi train.
-- Protocol cũ batch 4 đã hoàn thành Point (`~42.19/64.55`) và HUG e2e
-  (`~27.47/49.18`), Frozen-Point bị interrupt ở epoch 9. Không dùng các số này làm
-  multi-seed conclusion; chúng chứng minh batch 4 làm thay đổi objective/overfit.
-- Code và artifact seed42 cho U1/U2/U2-heads/U3 đã tồn tại dưới
-  `results/person2/` và `checkpoints/u*`; một số báo cáo cũ ghi “chưa implement”
-  là stale. Đây là nhánh cũ/secondary, chưa thay thế baseline audit của v2.
-- Không có training process đang được coi là active tại lần verify này.
+- Person1 hoàn tất Point và Frozen-Point: 3 seeds × 3 categories, clean,
+  modality và robustness. Point mean: Dress `47.98±0.32/71.49±0.90`, Shirt
+  `52.16±0.32/71.16±0.50`, Toptee `54.38±0.46/77.49±0.59`. Frozen mean trùng
+  Point đúng thiết kế; Frozen probabilistic Dress `48.31±0.51/71.79±1.14`.
+- Frozen uncertainty chưa calibrated: pooled severity-4 AUROC chỉ xấp xỉ
+  `0.49–0.52`; text typo/dropout làm R@10 rơi mạnh. Không build router/U1–U3
+  production claim.
+- Person2 no-go: HUG e2e Shirt seed42 `37.78/57.51`, thấp hơn paired
+  Point-matched `12.56/11.87`. Diagnostic Dress B8 xác nhận Point `47.00/71.10`
+  nhưng HC-only/HC+FC/HC+Cord/full HUG chỉ `~29–30/51–53`; FC/Cord không phải
+  nguyên nhân chính. Diagnostic tiếp theo cũng fail: HC mean-distance
+  `29.60/51.56`, còn average-negatives collapse xuống `6.25/14.53`. Gradient
+  Q-Former/query tokens hợp lệ; vấn đề nằm ở HC objective/reduction. Không sweep
+  full HUG; audit công thức trước khi train thêm.
+- `train.py` có instrumentation (trainability, pre-clip gradient, HC
+  distance/variance/LR) và early stopping. Hai diagnostic HC đã không qua gate;
+  không chạy lại hoặc mở rộng seed/category trước khi audit công thức.
+- `point_robust` đã hoàn tất Dress 3 seed: `49.17±0.08/72.10±0.57`, cao hơn
+  paired Point `+1.19/+0.61`. Delta trung bình mọi mức nhiễu text là
+  `+0.79/+1.10`, nhưng severity 3–4 chỉ tăng khoảng `+0.61` R@10, chưa đạt gate
+  robustness `+2.0` so với Point.
+- `point_continued` hoàn tất Dress 3 seed: `49.03±0.39/72.05±0.31`, cao hơn
+  Point `+1.06/+0.56`. Point Robust chỉ hơn control này `+0.13/+0.05` clean,
+  `+0.19/+0.43` trung bình mọi mức nhiễu text và `+0.23/+0.67` ở severity 3–4;
+  R@10 không tăng ở mọi seed. Phần lớn clean gain do train thêm; đóng góp riêng
+  của robust objective nhỏ và chưa ổn định.
+- Runbook canonical có bảng 4 kiến trúc, kết quả/gate và diagnostic plan:
+  `word&md&pdf/SUPERVISOR_EXPERIMENT_RUNBOOK.md`.
 
-Next decision gate:
+## 7. Quy tắc vận hành
 
-1. Sửa/check preflight PDF path.
-2. Chạy hai pilot Dress seed42.
-3. Point batch32 phải quay lại xấp xỉ `48/71`; HUG e2e không được OOM/NaN hoặc
-   collapse liên tục sau các epoch đầu.
-4. Chỉ sau đó khóa `E2E_BATCH_SIZE` và chạy Dress seeds `42,7,123`.
-
-## 7. Lệnh chuẩn
-
-```bash
-source ref/LAVIS/.venv/bin/activate
-./scripts/run_supervisor_experiments.sh preflight
-
-# Hai người/máy; nếu một GPU thì chạy tuần tự
-./scripts/run_supervisor_person1.sh pilot
-./scripts/run_supervisor_person2.sh pilot
-
-# Sau khi pilot pass
-SEEDS=42,7,123 CATEGORIES=dress ./scripts/run_supervisor_person1.sh clean
-SEEDS=42,7,123 CATEGORIES=dress ./scripts/run_supervisor_person2.sh clean
-
-./scripts/run_supervisor_person1.sh modality
-./scripts/run_supervisor_person2.sh modality
-./scripts/run_supervisor_person1.sh robustness
-./scripts/run_supervisor_person2.sh robustness
-./scripts/run_supervisor_experiments.sh summarize
-```
-
-Default v2: Point `B32/10 epochs/warmup0`; Frozen `B32/20/warmup0`; E2E và
-Point-matched `B8/30 epochs/warmup2`; seeds `42,7,123`; W&B off. Nếu E2E OOM,
-restart cả cặp bằng `FORCE=1 E2E_BATCH_SIZE=6 ...person2.sh pilot`, rồi mới thử
-batch 4. Khi batch đã khóa, không đổi giữa seed/category.
-
-Validation nhẹ, không chạy GPU dài:
-
-```bash
-python -m py_compile train.py eval.py eval/robustness.py \
-  eval/modality_reliance.py eval/summarize_supervisor.py
-bash -n scripts/run_supervisor_experiments.sh \
-  scripts/run_supervisor_person1.sh scripts/run_supervisor_person2.sh
-PYTHONPATH=. python tests/test_robustness_training.py
-git diff --check
-```
-
-## 8. Quy tắc vận hành và cập nhật
-
-- Bắt đầu session bằng `git status --short --branch`, đọc phần trạng thái trên,
-  rồi kiểm tra artifact thực tế; không dựa vào ký ức/log chat.
-- Không tự chạy job GPU dài khi user chỉ yêu cầu giải thích, review hoặc diagnose.
-- Không dùng `FORCE=1`, xóa checkpoint/result, hay dọn artifact lớn nếu user chưa
-  yêu cầu rõ. Giữ nguyên thay đổi không liên quan trong dirty worktree.
-- Run train chỉ hoàn tất khi có `checkpoint_final.pth`; run dở resume từ
-  `checkpoint_last.pth`. `checkpoint_best.pth` chỉ để eval. Robustness hoàn tất
-  khi có `.complete`. Mỗi run có `train.log`; W&B mặc định tắt.
-- Artifact v2 nằm dưới `checkpoints/supervisor_protocol_v2/` và
-  `results/supervisor_protocol_v2/`. Không trộn tự động với `supervisor_protocol/`
-  hoặc checkpoint legacy.
-- Khi hai máy chạy riêng, merge nguyên cấu trúc hai thư mục v2; model IDs tách
-  biệt nên không đè nhau. Chỉ summarize sau khi merge.
-- Sau một phase, chỉ cập nhật phần “Trạng thái hiện tại”: ngày/commit, phase đã
-  pass, đường dẫn summary canonical, quyết định go/no-go và bước kế tiếp. Không
-  thêm log từng epoch, danh sách mọi file hay bảng số dài vào `AGENTS.md`.
-- Số liệu chi tiết đi vào JSON/CSV và tài liệu báo cáo. Nếu protocol/invariant
-  thay đổi, cập nhật cả runbook và phần tương ứng ở đây; tránh tạo thêm runbook
-  cạnh tranh.
+- Bắt đầu session: `git status --short --branch`, đọc trạng thái trên, rồi
+  kiểm tra artifact thật. Không tự chạy GPU dài nếu user chỉ yêu cầu review.
+- Run hoàn tất chỉ khi có `checkpoint_final.pth`; run dở resume từ
+  `checkpoint_last.pth`; dùng `checkpoint_best.pth` để eval. Không dùng
+  `FORCE=1`, xoá/ghi đè artifact nếu chưa được yêu cầu.
+- Trước diagnostic mới, dùng `RESULT_ROOT` và `CHECKPOINT_ROOT` mới để giữ
+  artifact dở; giữ paired model/batch/seed. Không mở rộng seed/category hoặc
+  adaptive fusion trước Dress reliability pilot và calibration gates.
+- `results/reliability_v1/` và `checkpoints/reliability_v1/` là pilot read-only.
+  Nhánh mới chỉ dùng `results/reliability_v2/` và `checkpoints/reliability_v2/`;
+  không ghi đè supervisor protocol v2. Label train/val phải sinh từ cùng Point
+  checkpoint; không trộn `failure@10` và `failure@50`.

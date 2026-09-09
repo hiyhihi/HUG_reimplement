@@ -136,43 +136,7 @@ class BLIPBackbone(nn.Module):
         print(f"Loaded BLIP2: {self.num_query_tokens} query tokens, "
               f"hidden_dim={self.hidden_dim}, proj_dim={self.proj_dim}")
 
-    # =========================================================================
-    # LAVIS-style methods (clean, recommended usage)
-    # =========================================================================
-
-    # def extract_image_features_lavis(
-    #     self,
-    #     pixel_values: torch.Tensor
-    # ) -> Tuple[torch.Tensor, torch.Tensor]:
-    #     """
-    #     Extract features from images only (LAVIS style).
-
-    #     Uses BLIP2's image mode: Vision encoder → Q-Former → 32 query tokens
-
-    #     Args:
-    #         pixel_values: Image tensor of shape [batch_size, 3, 224, 224]
-
-    #     Returns:
-    #         image_embeds: Raw Q-Former query tokens, shape [batch, 32, 768]
-    #         image_embeds_proj: L2-normalized projected features, shape [batch, 32, 256]
-    #     """
-    #     # Convert input to match vision encoder dtype
-    #     # On GPU: use fp16 (as configured in BLIP2)
-    #     # On CPU: use float32 (converted in __init__ for compatibility)
-    #     if self.device == "cuda" and pixel_values.dtype != torch.float16:
-    #         pixel_values = pixel_values.to(torch.float16)
-    #     elif self.device == "cpu" and pixel_values.dtype != torch.float32:
-    #         pixel_values = pixel_values.to(torch.float32)
-
-    #     # Extract features using LAVIS method
-    #     feat = self.blip_model.extract_features({"image": pixel_values}, mode="image")
-
-    #     # feat.image_embeds: [batch, 32, 768] - Q-Former output (unnormalized)
-    #     # feat.image_embeds_proj: [batch, 32, 256] - Projected & L2-normalized
-    #     image_embeds = feat.image_embeds
-    #     image_embeds_proj = feat.image_embeds_proj
-
-    #     return image_embeds, image_embeds_proj
+    # LAVIS-style feature extraction.
     def extract_image_features_lavis(
         self,
         pixel_values,
@@ -181,9 +145,6 @@ class BLIPBackbone(nn.Module):
 
         device = pixel_values.device
 
-        # pixel_values = pixel_values.to(
-        #     dtype=self.blip_model.query_tokens.dtype
-        # )
         vision_dtype = next(
             self.blip_model.visual_encoder.parameters()
         ).dtype
@@ -256,41 +217,6 @@ class BLIPBackbone(nn.Module):
 
         return text_embeds, text_embeds_proj, text_cls
 
-    # def extract_multimodal_features_lavis(
-    #     self,
-    #     pixel_values: torch.Tensor,
-    #     texts: list
-    # ) -> torch.Tensor:
-    #     """
-    #     Extract multimodal features from image and text (LAVIS style).
-
-    #     Uses BLIP2's multimodal mode: Q-Former with cross-attention
-
-    #     Args:
-    #         pixel_values: Image tensor [batch, 3, 224, 224]
-    #         texts: List of text strings
-
-    #     Returns:
-    #         multimodal_embeds: Query tokens after cross-attention, shape [batch, 32, 768]
-    #     """
-    #     # Convert input to match vision encoder dtype
-    #     if self.device == "cuda" and pixel_values.dtype != torch.float16:
-    #         pixel_values = pixel_values.to(torch.float16)
-    #     elif self.device == "cpu" and pixel_values.dtype != torch.float32:
-    #         pixel_values = pixel_values.to(torch.float32)
-
-    #     # Extract features using LAVIS multimodal mode
-    #     feat = self.blip_model.extract_features(
-    #         {"image": pixel_values, "text_input": texts},
-    #         mode="multimodal"
-    #     )
-
-    #     # feat.multimodal_embeds: [batch, 32, 768]
-    #     # Query tokens after cross-attention with both image and text
-    #     multimodal_embeds = feat.multimodal_embeds
-
-    #     return multimodal_embeds
-
     def extract_multimodal_features_lavis(
         self,
         pixel_values,
@@ -301,9 +227,6 @@ class BLIPBackbone(nn.Module):
 
         device = pixel_values.device
 
-        # pixel_values = pixel_values.to(
-        #     dtype=self.blip_model.query_tokens.dtype
-        # )
         vision_dtype = next(
             self.blip_model.visual_encoder.parameters()
         ).dtype
@@ -331,11 +254,6 @@ class BLIPBackbone(nn.Module):
             else:
                 query_tokens = query_embeds
 
-            # query_tokens = self.blip_model.query_tokens.expand(
-            #     image_embeds.shape[0],
-            #     -1,
-            #     -1
-            # )
 
             query_atts = torch.ones(
                 query_tokens.size()[:-1],
@@ -442,28 +360,8 @@ class BLIPBackbone(nn.Module):
             text = self.tokenizer.decode(ids, skip_special_tokens=True)
             texts.append(text)
 
-        # # Extract features using LAVIS method
-        # # text_embeds: [batch, seq_len, 768] - all text tokens
-        # # text_embeds_proj: [batch, seq_len, 256] - projected tokens
-        # # text_cls: [batch, 256] - CLS token (global text representation)
-        # text_embeds, text_embeds_proj, text_cls = self.extract_text_features_lavis(texts)
-
-        # # Use the UNPROJECTED CLS token (hidden_dim=768, not 256)
-        # # Extract CLS from text_embeds (before projection)
-        # text_cls_unproj = text_embeds[:, 0, :]  # [batch, 768]
-
-        # # Expand CLS token to 32 tokens to match HUG's architecture
-        # # This broadcasts the same global text representation across all query tokens
-        # batch_size = text_cls_unproj.size(0)
-        # text_embeds = text_cls_unproj.unsqueeze(1).expand(batch_size, 32, 768)  # [batch, 32, 768]
-
-        # return text_embeds
         text_embeds, _, _ = self.extract_text_features_lavis(texts)
 
-# lấy đúng token embeddings từ QFormer
-# shape: [B, seq_len, 768]
-
-# truncate/pad về 32 tokens
 
         if text_embeds.size(1) >= 32:
             text_embeds = text_embeds[:, :32, :]
@@ -482,14 +380,6 @@ class BLIPBackbone(nn.Module):
 
         return text_embeds
 
-        # text_embeds = text_embeds[:, :32, :]
-        # mean_token = text_embeds.mean(dim=1, keepdim=True)
-
-        # text_feat = cls_token + mean_token
-
-        # text_feat = text_feat.expand(-1, 32, -1)
-
-        # return text_feat
 
     def extract_multimodal_features(
         self,

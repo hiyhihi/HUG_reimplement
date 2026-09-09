@@ -6,7 +6,20 @@ from modules.robustness_training import (
     blur_images,
     monotonic_ranking_loss,
     text_dropout_pair,
+    text_dropout_view,
 )
+
+
+def test_text_dropout_view_preserves_special_tokens():
+    ids = torch.tensor([[101, 10, 11, 102, 0], [101, 20, 21, 102, 0]])
+    masks = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 1, 0]])
+
+    dropped_ids, dropped_masks = text_dropout_view(ids, masks, probability=1.0)
+
+    assert torch.equal(dropped_ids[:, [0, 3, 4]], ids[:, [0, 3, 4]])
+    assert torch.equal(dropped_masks[:, [0, 3, 4]], masks[:, [0, 3, 4]])
+    assert torch.count_nonzero(dropped_ids[:, 1:3]) == 0
+    assert torch.count_nonzero(dropped_masks[:, 1:3]) == 0
 
 
 def main():

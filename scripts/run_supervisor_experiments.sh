@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DATA_ROOT=${DATA_ROOT:-"$ROOT_DIR/data/fashion-iq"}
 VENV=${VENV:-"$ROOT_DIR/ref/LAVIS/.venv/bin/activate"}
+PAPER_PDF=${PAPER_PDF:-"$ROOT_DIR/word&md&pdf/2601.11393v2 (1).pdf"}
 RESULT_ROOT=${RESULT_ROOT:-"$ROOT_DIR/results/supervisor_protocol_v2"}
 CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-"$ROOT_DIR/checkpoints/supervisor_protocol_v2"}
 SEEDS_CSV=${SEEDS:-42,7,123}
@@ -206,10 +207,14 @@ run_robustness() {
 case "${1:-help}" in
   preflight)
     python -m py_compile train.py eval.py eval/robustness.py eval/modality_reliance.py eval/summarize_supervisor.py
-    [[ -f "$ROOT_DIR/2601.11393v2 (1).pdf" ]]
+    if [[ ! -f "$PAPER_PDF" ]]; then
+      echo "Missing paper PDF: $PAPER_PDF" >&2
+      echo "Set PAPER_PDF to the absolute path of 2601.11393v2 (1).pdf if it is stored elsewhere." >&2
+      exit 1
+    fi
     for category in dress shirt toptee; do
-      [[ -f "$DATA_ROOT/captions/cap.$category.train.json" ]]
-      [[ -f "$DATA_ROOT/captions/cap.$category.val.json" ]]
+      [[ -f "$DATA_ROOT/captions/cap.$category.train.json" ]] || { echo "Missing training captions: $DATA_ROOT/captions/cap.$category.train.json" >&2; exit 1; }
+      [[ -f "$DATA_ROOT/captions/cap.$category.val.json" ]] || { echo "Missing validation captions: $DATA_ROOT/captions/cap.$category.val.json" >&2; exit 1; }
     done
     echo "Preflight passed."
     echo "Models=$MODELS_CSV Seeds=$SEEDS_CSV Categories=$CATEGORIES_CSV"
