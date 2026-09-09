@@ -16,13 +16,15 @@ This wrapper provides BOTH:
 
 import os
 import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
 # Add LAVIS to path
-lavis_path = os.path.expanduser("~/AAAI26-HUG/ref/LAVIS")
+project_root = Path(__file__).resolve().parents[1]
+lavis_path = str(Path(os.environ.get("LAVIS_ROOT", project_root / "ref/LAVIS")).resolve())
 if lavis_path not in sys.path:
     sys.path.insert(0, lavis_path)
 
@@ -72,7 +74,12 @@ class BLIPBackbone(nn.Module):
         cfg = OmegaConf.load(config_path)
 
         # Override checkpoint paths to use local weights
-        cfg.model.pretrained = "/mnt/data/users/quynhptit/huyptit/AAAI26-HUG/ref/LAVIS/pretrained_weights/blip2_pretrained.pth"
+        pretrained = Path(os.environ.get(
+            "BLIP2_PRETRAINED", Path(lavis_path) / "pretrained_weights/blip2_pretrained.pth"
+        ))
+        if not pretrained.is_file():
+            raise FileNotFoundError(f"Restore BLIP-2 weights or set BLIP2_PRETRAINED: {pretrained}")
+        cfg.model.pretrained = str(pretrained.resolve())
 
         # MONKEY PATCH to avoid BERT download
         # We'll load the model directly from our checkpoint
@@ -93,10 +100,10 @@ class BLIPBackbone(nn.Module):
         # Patch during model creation
         transformers.BertLMHeadModel.from_pretrained = mock_from_pretrained
 
-        model = model_cls.from_config(cfg.model)
-
-        # Restore original method
-        transformers.BertLMHeadModel.from_pretrained = original_from_pretrained
+        try:
+            model = model_cls.from_config(cfg.model)
+        finally:
+            transformers.BertLMHeadModel.from_pretrained = original_from_pretrained
 
         # Now load our checkpoint (has full Q-Former weights)
         model.load_checkpoint_from_config(cfg.model)

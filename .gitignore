@@ -193,8 +193,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-git config user.name "hiyhihi"
-git config user.email "huyphan1610@gmail.com"
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
@@ -207,11 +205,38 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-data/
-checkpoints/
-results/
-wandb/
-ref/
-/.env
+# Dataset code belongs in Git; dataset assets do not.
+/data/*
+!/data/__init__.py
+!/data/dataset.py
+!/data/transforms.py
+/checkpoints/
+/results/
+/wandb/
+/ref/
+/migration_exports/
+/.migration/
 /zip_tool.py
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.tar
+*.tar.gz
+*.zip
+*.orig
+*.rej
+*.tmp
+.env.*
+!.env.example
+*credentials*.json
+*client_secret*.json
+*token*.json
+rclone.conf
+*.pem
+*.key
+# Publish only reviewed project instructions, not all personal documents.
 /word&md&pdf/*
+!/word&md&pdf/RELIABILITY_AWARE_CIR_EXPERIMENT_RUNBOOK.md
+!/word&md&pdf/SUPERVISOR_EXPERIMENT_RUNBOOK.md
+!/word&md&pdf/THUCNGHIEM_TIEP_CIR_PROGRESS.md

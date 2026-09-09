@@ -34,6 +34,7 @@ from models.reliability_model import ReliabilityAwareCIR
 from modules.fiqc import FIQC_SCHEMA_VERSION, FIQCCorruptionGenerator
 from modules.losses import HUGLoss
 from modules.reliability import failure_prediction_loss, reliability_metrics
+from utils.artifact_paths import resolve_artifact_path
 
 
 def load_manifest(path):
@@ -123,8 +124,9 @@ def validate_manifests(train_rows, val_rows, point_checkpoint):
         raise ValueError("train and val manifests must use the same category")
     if train_rows[0]["failure_k"] != val_rows[0]["failure_k"]:
         raise ValueError("train and val manifests must use the same failure_k")
-    label_checkpoints = {str(Path(row["label_checkpoint"]).resolve()) for row in train_rows + val_rows}
-    expected_checkpoint = str(Path(point_checkpoint).resolve())
+    label_checkpoints = {str(resolve_artifact_path(value)) for value in
+                         {row["label_checkpoint"] for row in train_rows + val_rows}}
+    expected_checkpoint = str(resolve_artifact_path(point_checkpoint))
     if label_checkpoints != {expected_checkpoint}:
         raise ValueError("train and val labels must come from --point_checkpoint")
 

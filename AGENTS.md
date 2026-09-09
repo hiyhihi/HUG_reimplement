@@ -67,7 +67,7 @@ cả `hug_e2e - point` và `hug_e2e - point_matched`.
   query-only Reliability Head và head-only training trên frozen Point.
 - `scripts/run_reliability_cir.sh`: orchestrator schema/protocol `reliability_v2`; v1 read-only.
 
-## 6. Trạng thái hiện tại — verified 2026-09-06, dirty `main@cfe7b44`
+## 6. Trạng thái hiện tại — verified 2026-09-09
 
 - GVHD đã chuyển hướng sang reliability-aware CIR theo
   `word&md&pdf/Thucnghiem_tiep_CIR.docx`. Protocol chi tiết canonical mới:
@@ -78,14 +78,17 @@ cả `hug_e2e - point` và `hug_e2e - point_matched`.
   within-condition AUROC `0.7031`, nhưng synonym changed-rate train/val chỉ
   `88.05/88.75%`, dưới Gate 0; giữ toàn bộ v1 read-only làm pilot, chưa mở
   multi-seed/category hoặc adaptive fusion.
-- Code `reliability_v2` đã nâng Fashion-IQ-C schema 2, mở rộng synonym map,
-  fail-fast changed-rate, thêm nuisance/contradiction metrics, shortcut baselines,
-  within-condition audit, gate tổng hợp và risk-coverage CSV. Dress seed42 CPU
-  preflight 8/8 pass; audit thật đạt synonym changed-rate train `98.50%`, val
-  `98.76%`. **Chưa build label/train/evaluate GPU v2; chưa có gate v2.**
-- Bước tiếp theo duy nhất: chạy Dress seed42 v2 trong root mới; chỉ nếu JSON v2
-  có `adaptive_fusion_gate.passed=true` mới xác nhận Dress seeds 7/123. Adaptive
-  fusion vẫn đóng đến khi Dress multi-seed và complement analysis hoàn tất.
+- `reliability_v2` Dress seed42 đã hoàn tất: đủ best/last/final, 149625 train
+  rows và 50425 val rows (2017 query × 25 conditions). AUROC `0.7256`, AUPRC
+  `0.8114` (prevalence `0.6236`), ECE `0.0680`, risk reduction@50% `24.91%`;
+  `adaptive_fusion_gate.passed=true`. Synonym train/val `98.50/98.76%`;
+  within-condition AUROC `0.7099`. Clean `47.99/70.90`.
+- Best epoch 1, early stop epoch 4: có overfit. Val dùng chọn checkpoint và
+  đánh giá, không gọi là independent test. Contradiction ECE `0.1375`, báo riêng.
+- Chưa có reliability v2 seed7/123. Bước tiếp theo: xác nhận Dress seeds 7/123
+  cùng protocol, rồi mean±std/paired query-bootstrap CI. Không đổi loss/epoch
+  hậu nghiệm. Adaptive fusion vẫn đóng đến khi Dress multi-seed và complement
+  analysis hoàn tất; chưa mở Shirt/Toptee.
 
 - Person1 hoàn tất Point và Frozen-Point: 3 seeds × 3 categories, clean,
   modality và robustness. Point mean: Dress `47.98±0.32/71.49±0.90`, Shirt
@@ -130,3 +133,21 @@ cả `hug_e2e - point` và `hug_e2e - point_matched`.
   Nhánh mới chỉ dùng `results/reliability_v2/` và `checkpoints/reliability_v2/`;
   không ghi đè supervisor protocol v2. Label train/val phải sinh từ cùng Point
   checkpoint; không trộn `failure@10` và `failure@50`.
+
+## 8. Chuyển máy và lưu trữ
+
+- Điểm vào cho người mới: `README.md`; chi tiết `docs/MIGRATION.md`.
+- Git giữ code (bao gồm `data/*.py`) và 3 runbook đã whitelist. Dataset,
+  checkpoints/results, LAVIS/cache, archive và OAuth secrets không lên GitHub.
+- `scripts/migrate_project.py plan|pack|restore|verify`: backup riêng tư có
+  SHA-256, giữ đúng cây thư mục; không chép `.venv`, không overwrite file khác.
+- `scripts/upload_project_drive.sh` kiểm tra tài khoản `huyphan1610@gmail.com`
+  trước upload bằng rclone. Không upload qua connector nếu email không khớp.
+- `scripts/project_env.sh` cấu hình LAVIS/cache theo root mới;
+  `scripts/setup_new_machine.sh` cài lại môi trường từ snapshot Python 3.8.
+- `utils/artifact_paths.py` dùng `.migration/manifest.json` hoặc
+  `HUG_SOURCE_ROOT` để ánh xạ root cũ. Không sửa byte checkpoint, nhãn/rank hay
+  provenance gốc; không tự chọn checkpoint khác cùng basename.
+- Chỉ load checkpoint tin cậy. Sau restore: verify checksum, CPU preflight,
+  kiểm tra GPU/smoke root riêng trước run dài. Resume giữ epoch/optimizer;
+  trainer hiện chưa lưu RNG nên không claim bitwise-equivalent resume.

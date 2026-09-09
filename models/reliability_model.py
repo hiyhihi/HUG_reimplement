@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from .hug_model import HUGModel
 from modules.reliability import ReliabilityHead
+from utils.artifact_paths import resolve_artifact_path
 
 
 class ReliabilityAwareCIR(nn.Module):
@@ -30,6 +31,7 @@ class ReliabilityAwareCIR(nn.Module):
     def from_point_checkpoint(cls, checkpoint_path: str, device: torch.device,
                               bottleneck_dim: int = 256, dropout: float = 0.1,
                               freeze_backbone: bool = True) -> "ReliabilityAwareCIR":
+        checkpoint_path = resolve_artifact_path(checkpoint_path)
         checkpoint = torch.load(checkpoint_path, map_location=device)
         args = checkpoint.get("args", {})
         recipe = args.get("recipe", "point")
@@ -79,7 +81,7 @@ class ReliabilityAwareCIR(nn.Module):
 
 
 def load_reliability_checkpoint(checkpoint_path: str, device: torch.device) -> ReliabilityAwareCIR:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(resolve_artifact_path(checkpoint_path), map_location=device)
     if checkpoint.get("kind") != "reliability_aware_cir":
         raise ValueError(f"Not a reliability-aware checkpoint: {checkpoint_path}")
     args = checkpoint.get("args", {})

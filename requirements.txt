@@ -1,4 +1,7 @@
-# HUG Model Requirements
+# HUG Model Requirements (legacy supplemental dependencies)
+# For migration/reproduction: follow README.md and scripts/setup_new_machine.sh.
+# That workflow installs the exact environment snapshot from the private bundle.
+# This file alone is NOT a complete, locked training environment.
 #
 # This project depends on LAVIS (Salesforce BLIP-2 implementation).
 # LAVIS provides a pre-configured UV environment with all required dependencies.

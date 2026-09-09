@@ -7,9 +7,10 @@ standard CIR metrics: Recall@K, MRR, and Median Rank.
 
 import os
 import sys
+from pathlib import Path
 
 # Add LAVIS to path for processor
-lavis_path = os.path.expanduser("~/AAAI26-HUG/ref/LAVIS")
+lavis_path = str(Path(os.environ.get("LAVIS_ROOT", Path(__file__).resolve().parent / "ref/LAVIS")).resolve())
 if lavis_path not in sys.path:
     sys.path.insert(0, lavis_path)
 

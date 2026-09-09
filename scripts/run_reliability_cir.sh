@@ -3,8 +3,9 @@ set -euo pipefail
 
 # Reliability-aware CIR schema/protocol v2. Point and v1 artifacts are read-only.
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$ROOT_DIR/scripts/project_env.sh"
 DATA_ROOT=${DATA_ROOT:-"$ROOT_DIR/data/fashion-iq"}
-VENV=${VENV:-"$ROOT_DIR/ref/LAVIS/.venv/bin/activate"}
+VENV=${VENV:-"$ROOT_DIR/.venv/bin/activate"}
 CATEGORY=${CATEGORY:-dress}
 SEED=${SEED:-42}
 POINT_CHECKPOINT=${POINT_CHECKPOINT:-"$ROOT_DIR/checkpoints/supervisor_protocol_v2/point/$CATEGORY/seed$SEED/checkpoint_best.pth"}

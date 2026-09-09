@@ -25,6 +25,7 @@ from modules.fiqc import (
     FIQC_SCHEMA_VERSION, FIQC_SUITE, FIQCCorruptionGenerator, audit_text_corruptions, make_query_id,
 )
 from modules.reliability import reliability_metrics
+from utils.artifact_paths import resolve_artifact_path
 
 
 def _write_json(value, path):
@@ -406,7 +407,8 @@ def evaluate(args):
     }
     synonym_rows = [row for row in rows if row["corruption_type"] == "synonym_replacement"]
     synonym_rate = sum(bool(row["corruption_metadata"].get("changed")) for row in synonym_rows) / len(synonym_rows)
-    label_checkpoints = {str(Path(row["label_checkpoint"]).resolve()) for row in rows + train_rows}
+    label_checkpoints = {str(resolve_artifact_path(value)) for value in
+                         {row["label_checkpoint"] for row in rows + train_rows}}
     backbone_match = label_checkpoints == {str(Path(model.point_checkpoint).resolve())}
     condition_criteria = {
         "clean_auroc_ge_0_60": subsets["clean_only"]["auroc"] >= 0.60,
