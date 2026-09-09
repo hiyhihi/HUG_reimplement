@@ -1,5 +1,16 @@
 # Kiểm soát chuyển máy — 2026-09-09
 
+> Cập nhật theo yêu cầu đơn giản hóa: **dùng `scripts/zip_project.py` và README
+> làm lối vào chính**, không bắt buộc rclone/Google Drive. `essential` giữ đủ để
+> chạy tiếp; `current-full` giữ thêm last của run đã hoàn tất và JSON lịch sử.
+> ZIP mặc định KHÔNG chứa dataset đã backup riêng; chép `data/fashion-iq/` trước
+> setup/preflight. Dung lượng trước nén: essential ~17.22 GiB, current-full ~20.22 GiB.
+> `--include-dataset` mới bật lại dataset. Cây thư mục/checklist hiện hành ở AGENTS.md §9.
+> Các lệnh `migrate_project.py`/upload bên dưới là công cụ TAR tùy chọn cũ,
+> không dùng chúng để restore/upload ZIP. ZIP hỗ trợ `plan/pack/restore/verify`.
+> Tiến trình TAR cũ đã dừng theo yêu cầu đổi hướng; file `.tar.partial` còn trên
+> máy không phải backup hoàn chỉnh. Không xóa artifact gốc trước khi máy mới chạy được.
+
 ## Phạm vi và nguyên tắc
 
 Mục tiêu là tiếp tục **Dress reliability_v2 seeds 7/123** từ Point đã train,
@@ -19,7 +30,7 @@ khác tài khoản đích `huyphan1610@gmail.com`. Không upload qua connector n
 | Point Dress seed42/7/123 `checkpoint_best.pth` | Backbone chính xác cho label/train/eval từng seed |
 | Toàn bộ `checkpoints/reliability_v2/` | Best để eval, last để resume, final xác nhận hoàn tất |
 | Toàn bộ `results/reliability_v2/` | JSONL/CSV labels, summary, audit, probabilities, risk–coverage, log |
-| `data/fashion-iq/` | Ảnh + captions + image splits; chỉ checkpoint không đủ chạy |
+| `data/fashion-iq/` | **ZIP: backup riêng**, không đóng gói mặc định; TAR cũ vẫn gồm dataset |
 | `ref/LAVIS/` trừ `.git`, `.venv`, cache Python | Giữ source tùy biến, config, license và BLIP-2 pretrained |
 | Cache EVA `eva_vit_g.pth`, cache `bert-base-uncased` | Model khởi tạo vẫn cần EVA/BERT dù sau đó load Point |
 | Snapshot source hiện tại + 3 runbook Git | Có thể đối chiếu chính xác code với backup |

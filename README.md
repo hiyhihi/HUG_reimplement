@@ -37,51 +37,92 @@ Val hiện dùng cả chọn checkpoint và đánh giá; không gọi đây là 
 Head có dấu hiệu overfit sau epoch 1. V1 chỉ giữ làm pilot lịch sử vì fail
 synonym coverage; không trộn artifact v1/v2.
 
-## 3. Chuyển sang máy mới: làm theo thứ tự này
+## 3. Chuyển máy bằng một file ZIP
 
-### Máy cũ: tạo backup và upload
+**Không nên zip toàn bộ project.** Riêng `checkpoints/` trên máy nguồn đã ~238 GB;
+đa số là thí nghiệm lịch sử không cần cho hướng hiện tại. `.venv` cũng không nên
+chép sang máy mới. Dùng [scripts/zip_project.py](scripts/zip_project.py), chỉ cần
+Python chuẩn để đóng gói; không phải cài công cụ upload/đăng nhập Drive.
 
-Dừng các tiến trình đang train/build-label/evaluate trước khi đóng gói.
-Script không lấy `.venv`, tài khoản, token hay toàn bộ cache của người dùng.
+| Gói | Nội dung | Khi nào dùng |
+|---|---|---|
+| `essential` (mặc định, ~17.22 GiB trước nén) | Code/tài liệu, LAVIS + BLIP-2/EVA/BERT, Point Dress 42/7/123, kết quả v2; best/final của run xong, giữ last của run dở | **Khuyên dùng để chạy tiếp seed7/123** |
+| `current-full` (~20.22 GiB trước nén) | Như trên + last/optimizer của run đã xong + JSON lịch sử nhỏ | Muốn lưu đầy đủ trạng thái thực nghiệm v2 hiện tại |
+
+**Dataset Fashion-IQ đã lưu riêng nên mặc định không vào ZIP.** Code đọc dataset
+`data/*.py` và nhãn thực nghiệm `results/.../labels/` vẫn được giữ. Nếu cần đổi
+ý, thêm `--include-dataset` vào lệnh `plan`/`pack`.
+
+Cả hai **không phải backup toàn bộ lịch sử nghiên cứu**: không mang các checkpoint
+HUG cũ, `.git`, `.venv`, token hoặc cache không liên quan. `essential` không dùng
+để cố ý train tiếp một run đã hoàn tất từ optimizer cũ; khi cần việc đó dùng
+`current-full`. Giữ máy cũ cho đến khi máy mới đã kiểm thử thành công.
+
+### Máy cũ — xem dung lượng rồi tạo ZIP
+
+Dừng train/build-label/evaluate trước khi nén. Chạy trong project:
 
 ```bash
-python3 scripts/migrate_project.py plan
-python3 scripts/migrate_project.py pack --bundle migration_exports/cir-v2-20260909.tar
-# Cài rclone; cấu hình remote tên huydrive, loại Google Drive,
-# đăng nhập đúng huyphan1610@gmail.com. Chỉ cần làm một lần:
-rclone config
-bash scripts/upload_project_drive.sh migration_exports/cir-v2-20260909.tar huydrive
+# Chỉ xem dung lượng dự kiến, chưa nén:
+python3 scripts/zip_project.py plan
+
+# Tạo gói khuyên dùng:
+python3 scripts/zip_project.py pack
+
+# Hoặc gói đầy đủ hơn (không cần tạo cả hai):
+python3 scripts/zip_project.py pack --profile current-full
 ```
 
-Gói hiện khoảng **21.2 GiB**, cần ít nhất **25 GB trống trên Drive**. Giữ riêng tư;
-không chia sẻ công khai dataset/checkpoint. Script upload sẽ dừng nếu email không
-khớp. Không đóng gói lại cùng tên: dùng tên mới khi có kết quả mới.
+ZIP được lưu tại **`<project>/migration_exports/cir-essential-no-data.zip`**;
+gói current-full có tên `cir-current-full-no-data.zip`. Trên máy hiện tại, mở
+folder `migration_exports` trong VS Code/File Explorer để tải file sau khi nén xong:
 
-### Máy mới: clone → restore → cài môi trường → kiểm tra
+```text
+/mnt/data/users/quynhptit/huyptit/AAAI26-HUG/migration_exports/cir-essential-no-data.zip
+```
 
-Yêu cầu: Linux x86_64, GPU NVIDIA và driver phù hợp PyTorch CUDA 12.1;
-cài `git`, `uv`, `rclone`. Dành khoảng 70 GB trống cho archive, giải nén và môi trường.
+Có thể đổi nơi lưu bằng `--output /duong/dan/backup.zip`. Đường dẫn tương đối
+tính từ root project. Chỉ tải file `.zip` hoàn chỉnh, không tải `.zip.partial`.
+`plan` chỉ in kế hoạch/đường dẫn; chưa tạo ZIP.
+
+ZIP64 hỗ trợ file lớn hơn 4 GB; nén level1 để ưu tiên thời gian. `plan` báo dung
+lượng **trước nén**, không hứa checkpoint sẽ nén nhỏ nhiều. Chép ZIP sang máy mới
+bằng ổ đĩa/SCP hoặc tự upload Drive riêng tư. Không upload public dataset/checkpoint.
+Script không ghi đè ZIP có sẵn; lần backup mới hãy chọn tên mới.
+
+### Máy mới — giải nén → cài môi trường → chạy tiếp
+
+Yêu cầu: Linux x86_64, GPU NVIDIA/driver phù hợp CUDA12.1, Python3 và `uv`.
+Dành khoảng 70 GB trống cho archive, dữ liệu giải nén và môi trường.
+ZIP có sẵn code nên **không bắt buộc chờ GitHub**. Với ZIP tin cậy do bạn tự tạo,
+giải nén vào **thư mục mới, trống**:
 
 ```bash
-git clone https://github.com/hiyhihi/HUG_reimplement.git
+mkdir HUG_reimplement
 cd HUG_reimplement
-rclone config  # remote huydrive, đăng nhập đúng Gmail trên máy mới
-rclone copy huydrive:AAAI26-HUG-migration/cir-v2-20260909.tar migration_exports/ --progress
-python3 scripts/migrate_project.py restore --bundle migration_exports/cir-v2-20260909.tar
-python3 scripts/migrate_project.py verify
+python3 -m zipfile -e /duong/dan/cir-essential-no-data.zip .
+python3 scripts/zip_project.py verify
+# BƯỚC BẮT BUỘC: chép dataset đã lưu riêng vào data/fashion-iq/,
+# gồm images/, captions/, image_splits/, rồi mới chạy setup bên dưới.
 bash scripts/setup_new_machine.sh
 source scripts/project_env.sh
 nvidia-smi
 bash scripts/run_reliability_cir.sh gate
 ```
 
-Backup chứa snapshot code để đối chiếu. Nếu clone đã có code mới khác backup,
-restore sẽ **dừng**, không ghi đè: dùng checkout/clone đúng phiên bản của backup
-trong thư mục mới. Không dùng `--force` để che xung đột.
+Nếu muốn dùng Git: sau khi code đã push, clone đúng phiên bản có trong ZIP rồi
+chạy `python3 scripts/zip_project.py restore --input /duong/dan/cir-essential-no-data.zip`.
+Restore kiểm tra checksum và từ chối ghi đè file khác nội dung. Không ép overwrite
+nếu clone không khớp phiên bản ZIP. Phiên bản chuẩn bị trước đã commit cục bộ,
+nhưng push GitHub chưa thành công do thiếu đăng nhập; không mặc định remote đã mới.
 
-Không cần sửa `/mnt/...` trong JSON/PTH: mã sẽ ánh xạ root gốc qua
-`.migration/manifest.json`, giữ nguyên byte artifact. Nếu tự chép bằng tay,
-xem [hướng dẫn chi tiết](docs/MIGRATION.md).
+Không cần sửa đường dẫn `/mnt/...` trong JSON/PTH: `.migration/manifest.json`
+giữ root nguồn để mã tự ánh xạ sang root mới, không sửa nhãn/trọng số.
+`setup_new_machine.sh` tạo lại môi trường Python3.8 từ snapshot package, cần mạng
+để cài dependency. Preflight/gate chỉ là kiểm tra CPU/đọc kết quả đã lưu; kiểm tra
+GPU trên root smoke riêng trước run dài, xem [chi tiết](docs/MIGRATION.md).
+Đối chiếu đầy đủ cây thư mục, checkpoint nào bắt buộc/tùy chọn và các bước kiểm tra
+tại [AGENTS.md, mục 9](AGENTS.md#9-cây-thư-mục-đối-chiếu-trên-máy-mới).
 
 ## 4. Chạy tiếp thực nghiệm (sau khi khôi phục)
 
@@ -122,7 +163,8 @@ khả năng bổ trợ giữa các nhánh trước khi đề xuất fusion. Gate
 | `data/*.py`, `models/`, `modules/`, `eval/`, `scripts/`, `tests/` | Code; **Git** |
 | `data/fashion-iq/`, `ref/LAVIS/`, `.migration/cache/` | Dataset, LAVIS tùy biến và trọng số/cache; **Drive** |
 | `checkpoints/`, `results/` | Trọng số, nhãn, metrics, log; **Drive** |
-| `docs/MIGRATION.md` | Chi tiết backup, kiểm thử, giới hạn và note thay đổi |
+| `scripts/zip_project.py` | Lối vào chính: xem dung lượng, nén ZIP, restore và verify |
+| `docs/MIGRATION.md` | Chi tiết kỹ thuật; công cụ TAR/Drive cũ là lựa chọn phụ |
 
 Chỉ tên `AGENTS.md` là canonical; không tạo thêm `agent.md` dễ lệch trạng thái.
 Khi code/tài liệu mâu thuẫn, ưu tiên artifact thực tế rồi runbook canonical.

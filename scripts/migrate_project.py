@@ -40,7 +40,7 @@ def allowed(path):
                         ('credentials', 'client_secret', 'token.json', 'rclone.conf')))
 
 
-def inventory(root):
+def inventory(root, include_dataset=True):
     files = {}
 
     def add(source, destination):
@@ -64,6 +64,8 @@ def inventory(root):
     ).decode().split('\0')
     for name in names:
         path = Path(name)
+        if not include_dataset and name.startswith('data/fashion-iq/'):
+            continue
         if name and allowed(path) and (root / path).is_file():
             if (root / path).stat().st_size > 10 * 1024 * 1024:
                 raise ValueError(f'Unexpected large code file: {path}; fix .gitignore first')
@@ -71,9 +73,10 @@ def inventory(root):
     for seed in (42, 7, 123):
         path = Path(f'checkpoints/supervisor_protocol_v2/point/dress/seed{seed}/checkpoint_best.pth')
         add(root / path, path)
-    for name in ('checkpoints/reliability_v2', 'results/reliability_v2',
-                 'data/fashion-iq', 'ref/LAVIS'):
+    for name in ('checkpoints/reliability_v2', 'results/reliability_v2', 'ref/LAVIS'):
         add(root / name, name)
+    if include_dataset:
+        add(root / 'data/fashion-iq', 'data/fashion-iq')
     pretrained = 'ref/LAVIS/pretrained_weights/blip2_pretrained.pth'
     add(root / pretrained, pretrained)
     # Supervisor source is private on Drive, not published on GitHub.

@@ -137,9 +137,27 @@ cả `hug_e2e - point` và `hug_e2e - point_matched`.
 ## 8. Chuyển máy và lưu trữ
 
 - Điểm vào cho người mới: `README.md`; chi tiết `docs/MIGRATION.md`.
+- Cách đơn giản mặc định: `python3 scripts/zip_project.py plan`, sau đó chạy
+  `python3 scripts/zip_project.py pack`.
+  ZIP gồm cả code, không bắt buộc
+  có GitHub để chạy; giải nén vào thư mục mới rồi `verify`, setup và preflight.
+- Hai profile ZIP: `essential` bỏ last của run đã có final và JSON lịch sử;
+  `current-full` giữ đủ artifact v2. Cả hai giữ last của run dở, best/final của
+  run hoàn tất và Point Dress 42/7/123. Không zip toàn bộ ~238 GB checkpoints cũ.
+- Dataset Fashion-IQ đã được user backup riêng: ZIP mặc định KHÔNG có
+  `data/fashion-iq/`, vẫn giữ `data/*.py` và failure manifests trong `results/`.
+  Chỉ thêm dataset khi có `--include-dataset`; pack không yêu cầu dataset tồn tại
+  nếu không bật cờ này. Dung lượng trước nén: essential ~17.22 GiB, current-full
+  ~20.22 GiB (2026-09-09).
+- ZIP mặc định: `<project>/migration_exports/cir-essential-no-data.zip`;
+  profile current-full: `cir-current-full-no-data.zip`. `--output` tương đối
+  được tính từ `--root`/root project, không từ thư mục shell đang đứng. Khi còn
+  đuôi `.partial` thì chưa hoàn tất và không dùng để chuyển máy.
+- Chỉ thiết kế/test script khi user chưa yêu cầu nén thật; không tự chạy backup
+  hàng chục GB. Không tự push/upload trong yêu cầu chỉnh tài liệu/ZIP.
 - Git giữ code (bao gồm `data/*.py`) và 3 runbook đã whitelist. Dataset,
   checkpoints/results, LAVIS/cache, archive và OAuth secrets không lên GitHub.
-- `scripts/migrate_project.py plan|pack|restore|verify`: backup riêng tư có
+- Công cụ phụ cũ `scripts/migrate_project.py plan|pack|restore|verify`: TAR có
   SHA-256, giữ đúng cây thư mục; không chép `.venv`, không overwrite file khác.
 - `scripts/upload_project_drive.sh` kiểm tra tài khoản `huyphan1610@gmail.com`
   trước upload bằng rclone. Không upload qua connector nếu email không khớp.
@@ -151,3 +169,98 @@ cả `hug_e2e - point` và `hug_e2e - point_matched`.
 - Chỉ load checkpoint tin cậy. Sau restore: verify checksum, CPU preflight,
   kiểm tra GPU/smoke root riêng trước run dài. Resume giữ epoch/optimizer;
   trainer hiện chưa lưu RNG nên không claim bitwise-equivalent resume.
+- Git: commit migration trước đã lưu cục bộ (`7a86613`), push bị thiếu credential;
+  không khẳng định clone từ remote đã có các thay đổi. ZIP lấy source hiện tại.
+
+## 9. Cây thư mục đối chiếu trên máy mới
+
+`[ZIP]` có trong gói, `[RIÊNG]` lấy từ backup dataset, `[TẠO]` sinh khi cài/chạy,
+`[TÙY CHỌN]` không cần có trong essential. Cây này liệt kê cấu trúc phục vụ
+reliability v2; danh sách TỪNG file + kích thước + SHA-256 nằm trong
+`.migration/manifest.json`, dùng `verify` để kiểm tra đầy đủ (kể cả file con LAVIS).
+
+```text
+<project>/
+├── AGENTS.md, README.md, LICENSE, requirements.txt              [ZIP]
+├── train.py, train_reliability.py, eval.py                     [ZIP]
+├── config/                                                   [ZIP]
+│   ├── fashion_iq.yaml
+│   └── cirr.yaml
+├── data/
+│   ├── __init__.py, dataset.py, transforms.py                 [ZIP: code, KHÔNG bỏ]
+│   └── fashion-iq/                                           [RIÊNG: chép trước preflight]
+│       ├── images/<image_id>.png
+│       ├── captions/cap.dress.train.json
+│       ├── captions/cap.dress.val.json
+│       └── image_splits/split.dress.{train,val}.json
+├── models/                                                   [ZIP]
+│   ├── __init__.py, blip_backbone.py, hug_model.py
+│   └── reliability_model.py, uncertainty_head.py
+├── modules/                                                  [ZIP]
+│   ├── __init__.py, fiqc.py, reliability.py, losses.py
+│   └── metrics.py, dynamic_weighting.py, robustness_training.py
+├── utils/                                                    [ZIP]
+│   └── __init__.py, artifact_paths.py, checkpoint.py, logger.py
+├── eval/                                                     [ZIP]
+│   ├── reliability.py, robustness.py, robustness_legacy.py
+│   └── modality_reliance.py, summarize_supervisor.py
+├── scripts/                                                  [ZIP]
+│   ├── zip_project.py, migrate_project.py                     # cả hai cần cho ZIP tool
+│   ├── project_env.sh, setup_new_machine.sh
+│   └── run_reliability_cir.sh, ...                            # giữ cả scripts lịch sử
+├── tests/                                                    [ZIP: test_*.py]
+├── assets/                                                   [ZIP]
+├── docs/MIGRATION.md                                         [ZIP]
+├── word&md&pdf/                                              [ZIP]
+│   ├── Thucnghiem_tiep_CIR.docx
+│   ├── RELIABILITY_AWARE_CIR_EXPERIMENT_RUNBOOK.md
+│   ├── SUPERVISOR_EXPERIMENT_RUNBOOK.md
+│   └── THUCNGHIEM_TIEP_CIR_PROGRESS.md
+├── ref/LAVIS/                                               [ZIP: source/config/license]
+│   ├── lavis/                                               # gồm models/processors/configs
+│   └── pretrained_weights/blip2_pretrained.pth
+├── checkpoints/
+│   ├── supervisor_protocol_v2/point/dress/
+│   │   ├── seed42/checkpoint_best.pth                        [ZIP]
+│   │   ├── seed7/checkpoint_best.pth                         [ZIP]
+│   │   └── seed123/checkpoint_best.pth                       [ZIP]
+│   └── reliability_v2/dress/seed42/
+│       ├── checkpoint_best.pth                              [ZIP: eval]
+│       ├── checkpoint_final.pth                             [ZIP: đã hoàn tất]
+│       └── checkpoint_last.pth                              [TÙY CHỌN: current-full]
+├── results/reliability_v2/dress/seed42/                       [ZIP]
+│   ├── reliability_metrics.json
+│   ├── reliability_metrics.per_query.csv
+│   ├── reliability_metrics.risk_coverage.csv
+│   ├── logs/train_reliability.log
+│   └── labels/                                              # mỗi split train VÀ val:
+│       ├── fiqc_dress_{train,val}_seed42.jsonl
+│       ├── fiqc_dress_{train,val}_seed42.csv
+│       ├── fiqc_dress_{train,val}_seed42_summary.json
+│       ├── fiqc_dress_{train,val}_seed42_robustness.csv
+│       └── fiqc_dress_{train,val}_seed42_corruption_audit.json
+├── .migration/                                              [ZIP: thư mục ẩn, phải giữ]
+│   ├── manifest.json                                        # root gốc + inventory + SHA
+│   ├── environment.txt                                      # snapshot package để cài lại
+│   └── cache/
+│       ├── torch/hub/checkpoints/eva_vit_g.pth
+│       └── huggingface/hub/models--bert-base-uncased/
+│           └── blobs/, refs/, snapshots/
+├── .venv/                                                   [TẠO: setup_new_machine.sh]
+└── migration_exports/                                       # nơi ZIP được tạo; không tự nhét vào ZIP
+```
+
+Checklist máy mới:
+
+1. Chạy `python3 scripts/zip_project.py verify`: kiểm tra mọi file TRONG ZIP;
+   **không kiểm tra dataset đã backup riêng**, GPU hay dependency hệ thống.
+2. Chép dataset đúng `data/fashion-iq/` (đừng lồng thành `fashion-iq/fashion-iq/`).
+   Dress cần đủ ảnh của cả captions và gallery splits train/val, không chỉ ảnh
+   query. Shirt/Toptee có thể giữ từ backup riêng nhưng chưa mở thực nghiệm mới.
+3. Chạy `bash scripts/setup_new_machine.sh`, rồi `source scripts/project_env.sh`,
+   `bash scripts/run_reliability_cir.sh preflight` và `... gate` (seed42).
+4. Chưa có `checkpoints/reliability_v2/dress/{seed7,seed123}/` và thư mục results
+   tương ứng là bình thường: chúng chỉ sinh khi chạy hai seed tiếp theo. Không
+   nhầm với Point seed7/123 bên trên: hai Point checkpoint đó BẮT BUỘC phải có.
+5. Không có `.git`, `.venv` trước setup, `wandb/`, checkpoint HUG/v1 lịch sử
+   hoặc `last` của seed42 trong essential KHÔNG phải thiếu file. Run dở luôn cần last.
